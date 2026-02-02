@@ -11,6 +11,7 @@ DJI drone mission planning tool for Mavic 3T facade photography. Converts RTK-en
   - `numpy` - Numerical computing, matrix operations for coordinate transforms
   - `pyproj` - Geographic coordinate transformations, geoid calculations
   - `simplekml` - KML/KMZ file generation
+  - `PySide6` - Desktop GUI framework
 - **Standard Library**: xml.etree.ElementTree, zipfile, math, pathlib
 
 ## Project Conventions
@@ -24,7 +25,7 @@ DJI drone mission planning tool for Mavic 3T facade photography. Converts RTK-en
 
 ### Architecture Patterns
 - **Coordinate Pipeline**: GPS (WGS84) → ENU → Facade Local (X'/Y'/Z') → Waypoints → WPML
-- **Transformer Pattern**: `FacadeTransformer` / `FacadeCoordinateTransformer` classes encapsulate coordinate system conversions
+- **Transformer Pattern**: `FacadeTransformer` class encapsulates coordinate system conversions
 - **Dual Output**: Separate files for DJI execution (WGS84) and editor display (EGM96)
 - **Single-file scripts**: No package structure; each `.py` file is standalone
 
@@ -68,7 +69,10 @@ DJI drone mission planning tool for Mavic 3T facade photography. Converts RTK-en
 - Photos must contain valid GPS EXIF data (RTK-enhanced preferred)
 - Assumes facade is approximately planar (vertical plane)
 - Geoid separation hardcoded for Hong Kong region (~6.3m)
-- No GUI - command-line only
+
+## User Interfaces
+- **GUI**: `gui.py` - PySide6 desktop application with drag-and-drop support
+- **CLI**: `mavic3T_pp_kmz.py` - Command-line interface for scripting
 
 ## External Dependencies
 - **DJI FlySafe**: For mission validation and upload

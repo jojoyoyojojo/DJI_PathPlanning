@@ -36,7 +36,12 @@ source drone_env/bin/activate
 pip install -r requirements.txt
 ```
 
-### Run Mission Generator
+### Run GUI Application
+```bash
+python3 gui.py
+```
+
+### Run CLI Mission Generator
 ```bash
 # With 4 facade corner photos
 python3 mavic3T_pp_kmz.py photo1.jpg photo2.jpg photo3.jpg photo4.jpg
@@ -67,8 +72,8 @@ GPS (WGS84 from EXIF)
 ```
 
 ### Key Files
-- **mavic3T_pp_kmz.py**: Primary KMZ generator with `FacadeTransformer` class
-- **mavic3T_pp.py**: Extended version with comprehensive validation
+- **gui.py**: PySide6 desktop GUI application
+- **mavic3T_pp_kmz.py**: Core KMZ generator with `FacadeTransformer` class
 - **height_converter.py**: WGS84 ↔ EGM96 height conversion utility
 
 ### Output Structure
