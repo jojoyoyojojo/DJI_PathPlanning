@@ -335,16 +335,6 @@ class MainWindow(QMainWindow):
         self.combo_drone.addItems(["M3T"])
         layout.addWidget(self.combo_drone, 1, 1)
 
-        layout.addWidget(QLabel("Execute Height:"), 2, 0)
-        self.combo_exec_height = QComboBox()
-        self.combo_exec_height.addItems(["WGS84", "relativeToStartPoint"])
-        layout.addWidget(self.combo_exec_height, 2, 1)
-
-        layout.addWidget(QLabel("Template Height:"), 2, 2)
-        self.combo_template_height = QComboBox()
-        self.combo_template_height.addItems(["EGM96", "relativeToStartPoint"])
-        layout.addWidget(self.combo_template_height, 2, 3)
-
         return group
 
     # -------------------------------------------------------------------------
@@ -544,22 +534,14 @@ class MainWindow(QMainWindow):
             core.ENABLE_SMART_PLANNING = self.chk_smart_planning.isChecked()
             core.AUTO_FLIGHT_SPEED = self.spin_speed.value()
             core.GIMBAL_PITCH_DEG = self.spin_gimbal.value()
-            core.EXECUTE_HEIGHT_MODE = self.combo_exec_height.currentText()
-            core.TEMPLATE_HEIGHT_MODE = self.combo_template_height.currentText()
 
             # Generate
             self.transformer, self.flight_direction, self.generated_waypoints = \
                 core.build_waypoints_from_images(self.image_paths)
 
-            # Calculate RTK offset info
-            yps = [p[1] for p in self.transformer.facade_pts]
-            avg_y = sum(yps) / len(yps)
-            safe_y = avg_y - core.PHOTO_DISTANCE + core.FLIGHT_DISTANCE
-
             status = (
                 f"Status: {len(self.generated_waypoints)} waypoints generated\n"
-                f"Direction: {self.flight_direction} snake pattern\n"
-                f"RTK offset: camera Y'={avg_y:.2f}m → flight Y'={safe_y:.2f}m"
+                f"Direction: {self.flight_direction} snake pattern"
             )
             self.lbl_gen_status.setText(status)
             self.lbl_gen_status.setStyleSheet("color: #4caf50;")
