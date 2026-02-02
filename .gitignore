@@ -6,6 +6,7 @@ examples
 
 # 虚拟环境
 drone_env/
+.venv/
 venv/
 env/
 
