@@ -30,6 +30,7 @@ from typing import List, Tuple
 import zipfile
 import io
 import numpy as np
+from loguru import logger
 
 # ========================= User Config =========================
 # Photos (replace or pass via CLI)
@@ -45,6 +46,7 @@ PHOTO_DISTANCE = 5.0      # Distance from camera to facade when corner photos we
 FLIGHT_DISTANCE = 5.0     # Desired distance from facade for mission flight (meters)
 OVERLAP_RATE = 0.65
 ENABLE_SMART_PLANNING = True
+FORCE_VERTICAL_PLANE = True  # Force flight plane to be vertical regardless of camera position tilt
 
 # Camera FOV (deg)
 CAMERA_HFOV = 84.0
@@ -105,6 +107,7 @@ def _dms_to_deg(dms, ref):
 
 
 def read_gps(path: str) -> Tuple[float, float, float]:
+    logger.debug(f"Reading GPS from: {path}")
     with open(path, "rb") as f:
         tags = exifread.process_file(f, details=False)
     lat = _dms_to_deg(tags["GPS GPSLatitude"].values, tags["GPS GPSLatitudeRef"].printable)
@@ -124,6 +127,7 @@ def read_gps(path: str) -> Tuple[float, float, float]:
             alt = -alt
     else:
         alt = 0.0
+    logger.info(f"GPS extracted: lat={lat:.6f}, lon={lon:.6f}, alt={alt:.2f}m")
     return lat, lon, alt
 
 # ================= ENU & Facade Frame (approx) =================
@@ -145,16 +149,20 @@ def enu_to_geodetic(x, y, z, lat0, lon0, alt0):
 
 class FacadeTransformer:
     def __init__(self, gps4: List[Tuple[float, float, float]]):
+        logger.info("Initializing FacadeTransformer with 4 GPS points")
         if len(gps4) != 4:
             raise ValueError("需要 4 个点")
         self.gps = gps4
         self.ref = gps4[0]
+        logger.debug(f"Reference point: lat={self.ref[0]:.6f}, lon={self.ref[1]:.6f}, alt={self.ref[2]:.2f}m")
         self.enu = [geodetic_to_enu(lat, lon, alt, *self.ref) for (lat,lon,alt) in gps4]
+        logger.debug(f"ENU coordinates: {[(f'{e[0]:.2f}', f'{e[1]:.2f}', f'{e[2]:.2f}') for e in self.enu]}")
         self.R = None  # rows: x', y', z' in ENU
         self.origin = None
         self.plane = None
         self._build()
         self.facade_pts = [self.enu_to_facade(p) for p in self.enu]
+        logger.info("FacadeTransformer initialized successfully")
 
     @staticmethod
     def _cross(a,b):
@@ -177,25 +185,48 @@ class FacadeTransformer:
         return [best_n[0], best_n[1], best_n[2], d]
 
     def _build(self):
+        logger.debug("Fitting plane to camera positions")
         a,b,c,d = self._fit_plane(self.enu)
-        nlen = sqrt(a*a+b*b+c*c); yprime=[a/nlen,b/nlen,c/nlen]
+        nlen = sqrt(a*a+b*b+c*c); yprime_raw=[a/nlen,b/nlen,c/nlen]
+        logger.debug(f"Raw plane normal: [{yprime_raw[0]:.4f}, {yprime_raw[1]:.4f}, {yprime_raw[2]:.4f}]")
         avg = sum(a*p[0]+b*p[1]+c*p[2]+d for p in self.enu)/4.0
-        if avg<0: yprime=[-yprime[0],-yprime[1],-yprime[2]]; a,b,c,d=-a,-b,-c,-d
-        # width by low/high edges
-        sz=sorted(self.enu,key=lambda p:p[2]); low=sz[:2]; high=sz[2:]
-        vlow=[low[1][i]-low[0][i] for i in range(3)]
-        vhigh=[high[1][i]-high[0][i] for i in range(3)]
-        wvec = vlow if sqrt(sum(x*x for x in vlow))>sqrt(sum(x*x for x in vhigh)) else vhigh
-        wproj = sum(wvec[i]*yprime[i] for i in range(3))
-        wplane = [wvec[i]-wproj*yprime[i] for i in range(3)]
-        lwp = sqrt(sum(x*x for x in wplane))
-        if lwp<1e-9: raise ValueError("宽度向量与外立面垂直，无法确定X'")
-        xprime=[x/lwp for x in wplane]
-        zprime=self._cross(xprime,yprime)
-        if zprime[2]<0: zprime=[-z for z in zprime]; xprime=[-x for x in xprime]
+        if avg<0: yprime_raw=[-yprime_raw[0],-yprime_raw[1],-yprime_raw[2]]; a,b,c,d=-a,-b,-c,-d
+
+        if FORCE_VERTICAL_PLANE:
+            logger.info("Force vertical plane enabled - projecting normal to horizontal")
+            # Project normal onto horizontal plane (force vertical flight plane)
+            horiz_len = sqrt(yprime_raw[0]**2 + yprime_raw[1]**2)
+            if horiz_len < 1e-9:
+                logger.error("Facade normal is nearly vertical, cannot determine horizontal direction")
+                raise ValueError("外立面法向量近乎垂直地面，无法确定水平方向 (Facade normal is nearly vertical)")
+            yprime = [yprime_raw[0]/horiz_len, yprime_raw[1]/horiz_len, 0.0]
+            # Z' is always true vertical
+            zprime = [0.0, 0.0, 1.0]
+            # X' = Z' × Y' (horizontal, perpendicular to both)
+            xprime = self._cross(zprime, yprime)
+            logger.debug(f"Vertical plane - Y': [{yprime[0]:.4f}, {yprime[1]:.4f}, {yprime[2]:.4f}], Z': [0, 0, 1]")
+        else:
+            logger.info("Using original tilted plane fitting")
+            # Original behavior: use fitted plane as-is
+            yprime = yprime_raw
+            # width by low/high edges
+            sz=sorted(self.enu,key=lambda p:p[2]); low=sz[:2]; high=sz[2:]
+            vlow=[low[1][i]-low[0][i] for i in range(3)]
+            vhigh=[high[1][i]-high[0][i] for i in range(3)]
+            wvec = vlow if sqrt(sum(x*x for x in vlow))>sqrt(sum(x*x for x in vhigh)) else vhigh
+            wproj = sum(wvec[i]*yprime[i] for i in range(3))
+            wplane = [wvec[i]-wproj*yprime[i] for i in range(3)]
+            lwp = sqrt(sum(x*x for x in wplane))
+            if lwp<1e-9: raise ValueError("宽度向量与外立面垂直，无法确定X'")
+            xprime=[x/lwp for x in wplane]
+            zprime=self._cross(xprime,yprime)
+            if zprime[2]<0: zprime=[-z for z in zprime]; xprime=[-x for x in xprime]
+            logger.debug(f"Tilted plane - Z': [{zprime[0]:.4f}, {zprime[1]:.4f}, {zprime[2]:.4f}]")
+
         self.R=[xprime,yprime,zprime]
         self.origin=[sum(p[i] for p in self.enu)/4.0 for i in range(3)]
         self.plane=[a,b,c,d]
+        logger.debug(f"Facade origin: [{self.origin[0]:.2f}, {self.origin[1]:.2f}, {self.origin[2]:.2f}]")
 
     def enu_to_facade(self, enu):
         t=[enu[i]-self.origin[i] for i in range(3)]
@@ -225,20 +256,25 @@ def plan_steps(direction: str, distance: float, overlap: float):
 # =================== Build mission & outputs ===================
 
 def build_waypoints_from_images(images: List[str]):
+    logger.info(f"Building waypoints from {len(images)} images")
     gps4=[read_gps(p) for p in images]
     tf=FacadeTransformer(gps4)
 
     xs=[p[0] for p in tf.facade_pts]; zs=[p[2] for p in tf.facade_pts]
     w=max(xs)-min(xs); h=max(zs)-min(zs)
+    logger.info(f"Facade dimensions: width={w:.2f}m, height={h:.2f}m")
 
     if ENABLE_SMART_PLANNING:
         direction = "vertical" if h>w else "horizontal"
+        logger.debug(f"Smart planning enabled, selected direction: {direction}")
     else:
         direction = "horizontal"
+        logger.debug("Smart planning disabled, using horizontal direction")
 
     step_cross, step_along = plan_steps(direction, FLIGHT_DISTANCE, OVERLAP_RATE)
     cross_span = w if direction=="vertical" else h
     num_lines = int(max(1, round(cross_span/step_cross))) + 1
+    logger.debug(f"Step cross={step_cross:.2f}m, step along={step_along:.2f}m, num_lines={num_lines}")
 
     minx,maxx=min(xs),max(xs); minz,maxz=min(zs),max(zs)
     yps=[p[1] for p in tf.facade_pts]
@@ -246,7 +282,7 @@ def build_waypoints_from_images(images: List[str]):
     # RTK workflow: camera plane is parallel to facade, offset by PHOTO_DISTANCE
     # Flight plane = camera plane - PHOTO_DISTANCE (to facade) + FLIGHT_DISTANCE (from facade)
     safe_y = avg_y - PHOTO_DISTANCE + FLIGHT_DISTANCE
-    print(f"RTK offset: camera Y'={avg_y:.2f}m, photo_dist={PHOTO_DISTANCE}m, flight_dist={FLIGHT_DISTANCE}m → flight Y'={safe_y:.2f}m")
+    logger.info(f"RTK offset: camera Y'={avg_y:.2f}m, photo_dist={PHOTO_DISTANCE}m, flight_dist={FLIGHT_DISTANCE}m → flight Y'={safe_y:.2f}m")
 
     wps=[]
     if direction=="vertical":
@@ -268,6 +304,7 @@ def build_waypoints_from_images(images: List[str]):
                 X = minx + xr*(maxx-minx)
                 wps.append(tf.facade_to_gps((X, safe_y, Z)))
 
+    logger.info(f"Generated {len(wps)} waypoints with {direction} snake pattern")
     return tf, direction, wps
 
 # ---------- Generic KML (for Google Earth) ----------
@@ -630,7 +667,8 @@ def write_kmz(template_xml: Element, waylines_xml: Element, kmz_path: str):
     # Ensure .kmz extension
     if not kmz_path.lower().endswith('.kmz'):
         kmz_path = kmz_path + '.kmz'
-    
+
+    logger.info(f"Writing KMZ file: {kmz_path}")
     # Create KMZ with correct DJI structure: wpmz/ subdirectory
     with zipfile.ZipFile(kmz_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         # DJI requires files in wpmz/ subdirectory
@@ -638,36 +676,43 @@ def write_kmz(template_xml: Element, waylines_xml: Element, kmz_path: str):
         zf.writestr("wpmz/waylines.wpml", save_xml(waylines_xml))
         # Optional: add res/ folder for resources if needed
         # zf.writestr("wpmz/res/.keep", b"")
+    logger.success(f"KMZ saved: {kmz_path}")
 
 # ============================ Main =============================
 
 def main(argv: List[str]):
+    logger.info("Starting Mavic 3T Facade Mission Planner")
     if len(argv) >= 5:
         images = argv[1:]
+        logger.debug(f"Using {len(images)} images from command line arguments")
     else:
         images = PHOTO_PATHS
+        logger.debug(f"Using {len(images)} images from PHOTO_PATHS config")
         for p in images:
             if not Path(p).exists():
-                print(f"Missing photo: {p}")
+                logger.error(f"Missing photo: {p}")
                 sys.exit(1)
 
     mission_name = sanitize_name(MISSION_NAME) or "Mission"
+    logger.info(f"Mission name: {mission_name}")
 
-    print("Building facade mission...")
+    logger.info("Building facade mission...")
     tf, direction, wps = build_waypoints_from_images(images)
-    print(f"Direction: {direction}, waypoints: {len(wps)}")
+    logger.info(f"Direction: {direction}, waypoints: {len(wps)}")
 
     # Preview KML
     kml = build_generic_kml(wps)
-    ElementTree(kml).write(f"{mission_name}_preview.kml", encoding="utf-8", xml_declaration=True)
-    print(f"✓ Saved preview: {mission_name}_preview.kml")
+    preview_path = f"{mission_name}_preview.kml"
+    ElementTree(kml).write(preview_path, encoding="utf-8", xml_declaration=True)
+    logger.success(f"Saved preview: {preview_path}")
 
     # KMZ (wpmz/template.kml + wpmz/waylines.wpml)
     waylines = build_waylines_wpml(tf, wps)
     template = build_template_kml(tf, wps)
     kmz_file = f"{mission_name}.kmz"
     write_kmz(template, waylines, kmz_file)
-    print(f"✓ Saved KMZ (WPML package): {kmz_file}")
+
+    logger.info("Mission generation complete")
 
 
 if __name__ == "__main__":

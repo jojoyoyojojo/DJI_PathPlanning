@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QMimeData
 from PySide6.QtGui import QPixmap, QDragEnterEvent, QDropEvent, QImage
+from loguru import logger
 
 # Import core algorithm functions
 import mavic3T_pp_kmz as core
@@ -120,13 +121,16 @@ class DropZone(QFrame):
             path = url.toLocalFile()
             if os.path.isdir(path):
                 # Scan folder for images
+                logger.debug(f"Scanning folder: {path}")
                 paths.extend(self._scan_folder(path))
             elif self._is_image(path):
                 paths.append(path)
 
         if paths:
+            logger.info(f"Dropped {len(paths)} images")
             self.images_dropped.emit(paths[:4])  # Limit to 4
             if len(paths) > 4:
+                logger.warning(f"Too many images ({len(paths)}), using first 4")
                 QMessageBox.warning(
                     self, "Too Many Images",
                     f"Found {len(paths)} images. Only the first 4 will be used."
@@ -307,6 +311,12 @@ class MainWindow(QMainWindow):
         self.chk_smart_planning.stateChanged.connect(self._on_param_changed)
         layout.addWidget(self.chk_smart_planning, 1, 2, 1, 2)
 
+        self.chk_force_vertical = QCheckBox("Force Vertical Plane")
+        self.chk_force_vertical.setChecked(True)
+        self.chk_force_vertical.setToolTip("Ensure flight path is on a true vertical plane regardless of camera position tilt")
+        self.chk_force_vertical.stateChanged.connect(self._on_param_changed)
+        layout.addWidget(self.chk_force_vertical, 2, 0, 1, 4)
+
         return group
 
     # -------------------------------------------------------------------------
@@ -416,6 +426,7 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
     def _on_images_dropped(self, paths: List[str]):
         """Handle images dropped or selected."""
+        logger.info(f"Loading {len(paths[:4])} images")
         self.image_paths = paths[:4]
         self.drop_zone.update_thumbnails(self.image_paths)
         self._extract_gps()
@@ -459,6 +470,7 @@ class MainWindow(QMainWindow):
 
     def _clear_images(self):
         """Clear all loaded images."""
+        logger.info("Clearing all loaded images")
         self.image_paths = []
         self.gps_data = []
         self.drop_zone.clear()
@@ -472,6 +484,7 @@ class MainWindow(QMainWindow):
 
     def _extract_gps(self):
         """Extract GPS from loaded images."""
+        logger.debug("Extracting GPS data from images")
         self.gps_data = []
         info_lines = []
 
@@ -486,6 +499,7 @@ class MainWindow(QMainWindow):
                     f"Photo {i+1}: {abs(lat):.6f}°{lat_dir}, {abs(lon):.6f}°{lon_dir}, {alt:.1f}m (WGS84)"
                 )
             except Exception as e:
+                logger.error(f"Failed to extract GPS from photo {i+1}: {e}")
                 info_lines.append(f"Photo {i+1}: ERROR - {str(e)}")
                 self.gps_data.append(None)
 
@@ -498,7 +512,9 @@ class MainWindow(QMainWindow):
                 width = max(xs) - min(xs)
                 height = max(zs) - min(zs)
                 info_lines.append(f"\nFacade: {width:.1f}m × {height:.1f}m")
+                logger.info(f"Facade detected: {width:.1f}m × {height:.1f}m")
             except Exception as e:
+                logger.error(f"Facade analysis error: {e}")
                 info_lines.append(f"\nFacade analysis error: {str(e)}")
 
         self.txt_info.setPlainText("\n".join(info_lines))
@@ -514,16 +530,22 @@ class MainWindow(QMainWindow):
 
     def _generate_mission(self):
         """Generate mission waypoints."""
+        logger.info("Starting mission generation")
         if len(self.image_paths) != 4:
+            logger.warning("Cannot generate: need exactly 4 images")
             QMessageBox.warning(self, "Error", "Please load exactly 4 images.")
             return
 
         if not all(g is not None for g in self.gps_data):
+            logger.warning("Cannot generate: some images have invalid GPS data")
             QMessageBox.warning(self, "Error", "Some images have invalid GPS data.")
             return
 
         try:
             # Update core module parameters
+            logger.debug(f"Parameters: photo_dist={self.spin_photo_dist.value()}, flight_dist={self.spin_flight_dist.value()}")
+            logger.debug(f"Parameters: HFOV={self.spin_hfov.value()}, VFOV={self.spin_vfov.value()}, overlap={self.spin_overlap.value()}")
+            logger.debug(f"Parameters: force_vertical={self.chk_force_vertical.isChecked()}, smart_planning={self.chk_smart_planning.isChecked()}")
             core.PHOTO_DISTANCE = self.spin_photo_dist.value()
             core.FLIGHT_DISTANCE = self.spin_flight_dist.value()
             core.CAMERA_HFOV = self.spin_hfov.value()
@@ -532,6 +554,7 @@ class MainWindow(QMainWindow):
             core.VFOV_RAD = core.radians(core.CAMERA_VFOV)
             core.OVERLAP_RATE = self.spin_overlap.value()
             core.ENABLE_SMART_PLANNING = self.chk_smart_planning.isChecked()
+            core.FORCE_VERTICAL_PLANE = self.chk_force_vertical.isChecked()
             core.AUTO_FLIGHT_SPEED = self.spin_speed.value()
             core.GIMBAL_PITCH_DEG = self.spin_gimbal.value()
 
@@ -539,6 +562,7 @@ class MainWindow(QMainWindow):
             self.transformer, self.flight_direction, self.generated_waypoints = \
                 core.build_waypoints_from_images(self.image_paths)
 
+            logger.success(f"Generated {len(self.generated_waypoints)} waypoints ({self.flight_direction} pattern)")
             status = (
                 f"Status: {len(self.generated_waypoints)} waypoints generated\n"
                 f"Direction: {self.flight_direction} snake pattern"
@@ -547,6 +571,7 @@ class MainWindow(QMainWindow):
             self.lbl_gen_status.setStyleSheet("color: #4caf50;")
 
         except Exception as e:
+            logger.error(f"Generation failed: {e}")
             QMessageBox.critical(self, "Generation Error", str(e))
             self.lbl_gen_status.setText(f"Status: Error - {str(e)}")
             self.lbl_gen_status.setStyleSheet("color: #f44336;")
@@ -561,12 +586,15 @@ class MainWindow(QMainWindow):
 
     def _save_output(self, mode: str):
         """Save output files."""
+        logger.info(f"Saving output files (mode: {mode})")
         if not self.generated_waypoints or not self.transformer:
+            logger.warning("Cannot save: no mission generated")
             QMessageBox.warning(self, "Error", "Please generate mission first.")
             return
 
         output_dir = self.edit_output_dir.text()
         if not os.path.isdir(output_dir):
+            logger.warning(f"Invalid output directory: {output_dir}")
             QMessageBox.warning(self, "Error", "Invalid output directory.")
             return
 
@@ -579,6 +607,7 @@ class MainWindow(QMainWindow):
                 kml_path = os.path.join(output_dir, f"{mission_name}_preview.kml")
                 core.ElementTree(kml).write(kml_path, encoding="utf-8", xml_declaration=True)
                 saved_files.append(kml_path)
+                logger.success(f"Saved preview KML: {kml_path}")
 
             if mode in ("kmz", "both"):
                 waylines = core.build_waylines_wpml(self.transformer, self.generated_waypoints)
@@ -591,6 +620,7 @@ class MainWindow(QMainWindow):
             self.lbl_save_status.setStyleSheet("color: #4caf50;")
 
         except Exception as e:
+            logger.error(f"Save failed: {e}")
             QMessageBox.critical(self, "Save Error", str(e))
             self.lbl_save_status.setText(f"Error: {str(e)}")
             self.lbl_save_status.setStyleSheet("color: #f44336;")
@@ -615,11 +645,13 @@ class MainWindow(QMainWindow):
 # =============================================================================
 
 def main():
+    logger.info("Starting Mavic 3T Facade Mission Planner GUI")
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
     window = MainWindow()
     window.show()
+    logger.info("GUI window displayed")
 
     sys.exit(app.exec())
 
