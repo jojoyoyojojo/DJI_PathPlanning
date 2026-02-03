@@ -345,6 +345,15 @@ class MainWindow(QMainWindow):
         self.combo_drone.addItems(["M3T"])
         layout.addWidget(self.combo_drone, 1, 1)
 
+        layout.addWidget(QLabel("Height Offset (m):"), 1, 2)
+        self.spin_height_offset = QDoubleSpinBox()
+        self.spin_height_offset.setRange(-100.0, 100.0)
+        self.spin_height_offset.setValue(0.0)
+        self.spin_height_offset.setDecimals(1)
+        self.spin_height_offset.setToolTip("Add constant offset to all waypoint altitudes (positive = higher)")
+        self.spin_height_offset.valueChanged.connect(self._on_param_changed)
+        layout.addWidget(self.spin_height_offset, 1, 3)
+
         return group
 
     # -------------------------------------------------------------------------
@@ -546,6 +555,7 @@ class MainWindow(QMainWindow):
             logger.debug(f"Parameters: photo_dist={self.spin_photo_dist.value()}, flight_dist={self.spin_flight_dist.value()}")
             logger.debug(f"Parameters: HFOV={self.spin_hfov.value()}, VFOV={self.spin_vfov.value()}, overlap={self.spin_overlap.value()}")
             logger.debug(f"Parameters: force_vertical={self.chk_force_vertical.isChecked()}, smart_planning={self.chk_smart_planning.isChecked()}")
+            logger.debug(f"Parameters: height_offset={self.spin_height_offset.value()}")
             core.PHOTO_DISTANCE = self.spin_photo_dist.value()
             core.FLIGHT_DISTANCE = self.spin_flight_dist.value()
             core.CAMERA_HFOV = self.spin_hfov.value()
@@ -557,6 +567,7 @@ class MainWindow(QMainWindow):
             core.FORCE_VERTICAL_PLANE = self.chk_force_vertical.isChecked()
             core.AUTO_FLIGHT_SPEED = self.spin_speed.value()
             core.GIMBAL_PITCH_DEG = self.spin_gimbal.value()
+            core.HEIGHT_OFFSET = self.spin_height_offset.value()
 
             # Generate
             self.transformer, self.flight_direction, self.generated_waypoints = \

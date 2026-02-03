@@ -57,6 +57,7 @@ DRONE_TYPE = "M3T"
 AUTO_FLIGHT_SPEED = 4.0
 GIMBAL_PITCH_DEG = 0.0     # level shot at each point
 HEADING_MODE = "UsePointSetting"
+HEIGHT_OFFSET = 0.0        # Constant offset added to all waypoint altitudes (meters)
 
 # Height reference modes
 # waylines.wpml (execution): "WGS84" or "relativeToStartPoint"
@@ -279,9 +280,11 @@ def build_waypoints_from_images(images: List[str]):
     minx,maxx=min(xs),max(xs); minz,maxz=min(zs),max(zs)
     yps=[p[1] for p in tf.facade_pts]
     avg_y = sum(yps)/len(yps)
-    # RTK workflow: camera plane is parallel to facade, offset by PHOTO_DISTANCE
-    # Flight plane = camera plane - PHOTO_DISTANCE (to facade) + FLIGHT_DISTANCE (from facade)
-    safe_y = avg_y - PHOTO_DISTANCE + FLIGHT_DISTANCE
+    # RTK workflow: Y' points toward facade (building)
+    # - Camera positions are at Y' ≈ 0 (centered at origin)
+    # - Facade surface is at Y' = avg_y + PHOTO_DISTANCE (toward building)
+    # - Flight plane is at Y' = facade - FLIGHT_DISTANCE (between camera and facade)
+    safe_y = avg_y + PHOTO_DISTANCE - FLIGHT_DISTANCE
     logger.info(f"RTK offset: camera Y'={avg_y:.2f}m, photo_dist={PHOTO_DISTANCE}m, flight_dist={FLIGHT_DISTANCE}m → flight Y'={safe_y:.2f}m")
 
     wps=[]
@@ -303,6 +306,11 @@ def build_waypoints_from_images(images: List[str]):
                 xr = (j if i%2==0 else (num_along-1-j))/(num_along-1) if num_along>1 else 0.0
                 X = minx + xr*(maxx-minx)
                 wps.append(tf.facade_to_gps((X, safe_y, Z)))
+
+    # Apply height offset if specified
+    if HEIGHT_OFFSET != 0.0:
+        logger.info(f"Applying height offset: {HEIGHT_OFFSET:+.1f}m to all waypoints")
+        wps = [(lat, lon, alt + HEIGHT_OFFSET) for lat, lon, alt in wps]
 
     logger.info(f"Generated {len(wps)} waypoints with {direction} snake pattern")
     return tf, direction, wps
@@ -373,9 +381,9 @@ def build_waylines_wpml(tf: FacadeTransformer, wps: List[Tuple[float,float,float
     SubElement(folder, "wpml:duration").text = "0"
     SubElement(folder, "wpml:autoFlightSpeed").text = str(AUTO_FLIGHT_SPEED)
 
-    # Heading facing wall: −Y' in ENU
+    # Heading facing wall: Y' points toward facade, so drone faces in Y' direction
     R = tf.R; yprime_enu = np.array(R[1], dtype=float)
-    to_wall = -yprime_enu
+    to_wall = yprime_enu
     nrm = np.linalg.norm(to_wall[:2]) + 1e-12
     to_wall[:2] /= nrm
     def yaw_from_xy(vxy):
@@ -543,9 +551,9 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
     SubElement(folder, "wpml:globalWaypointTurnMode").text = "toPointAndStopWithDiscontinuityCurvature"
     SubElement(folder, "wpml:globalUseStraightLine").text = "1"
 
-    # Heading facing wall: −Y' in ENU
+    # Heading facing wall: Y' points toward facade, so drone faces in Y' direction
     R = tf.R; yprime_enu = np.array(R[1], dtype=float)
-    to_wall = -yprime_enu
+    to_wall = yprime_enu
     nrm = np.linalg.norm(to_wall[:2]) + 1e-12
     to_wall[:2] /= nrm
     def yaw_from_xy(vxy):
