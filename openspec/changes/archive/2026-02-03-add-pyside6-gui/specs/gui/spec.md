@@ -94,10 +94,6 @@ The system SHALL provide a zone for configuring drone flight parameters.
 - **WHEN** user modifies gimbal pitch spin box
 - **THEN** value is validated (-90 to +30 degrees range)
 
-#### Scenario: Height mode selection
-- **WHEN** user selects execute height mode or template height mode from combo boxes
-- **THEN** selected mode is used in KMZ generation
-
 ---
 
 ### Requirement: Image Info Zone
@@ -127,7 +123,6 @@ The system SHALL provide a zone for triggering mission generation and displaying
 - **WHEN** user clicks "Generate Mission" with all 4 valid photos loaded
 - **THEN** waypoints are calculated using core algorithm
 - **AND** waypoint count and flight direction are displayed
-- **AND** RTK offset details are shown
 
 #### Scenario: Generate validation
 - **WHEN** user clicks "Generate Mission" without all 4 photos
