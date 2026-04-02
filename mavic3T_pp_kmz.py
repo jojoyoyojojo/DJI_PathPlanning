@@ -23,10 +23,10 @@ For EGM96, plug your geoid model in `egm96_geoid_offset(lat, lon)`.
 
 import sys
 import exifread
-from math import radians, cos, tan, sqrt, degrees, atan2
+from math import radians, cos, tan, sqrt, degrees, atan2, acos, hypot
 from pathlib import Path
 from xml.etree.ElementTree import Element, SubElement, ElementTree, tostring
-from typing import List, Tuple
+from typing import Dict, List, Tuple, Any
 import zipfile
 import io
 import numpy as np
@@ -40,21 +40,65 @@ PHOTO_PATHS = [
     '/Users/andyliu/Downloads/hkstp_test/11/DJI_0112.JPG',
 ]
 
-# Planning
+# Planning（与 GUI / 校验一致：拍照距离与飞行距离 3–20 m）
+PHOTO_DISTANCE_MIN = 3.0
+PHOTO_DISTANCE_MAX = 20.0
+FLIGHT_DISTANCE_MIN = 3.0
+FLIGHT_DISTANCE_MAX = 20.0
+AUTO_FLIGHT_SPEED_MIN = 0.1
+AUTO_FLIGHT_SPEED_MAX = 10.0
+
 PHOTO_DISTANCE = 5.0      # Distance from camera to facade when corner photos were taken (meters) - RTK prior knowledge
 FLIGHT_DISTANCE = 5.0     # Desired distance from facade for mission flight (meters)
-OVERLAP_RATE = 0.65
+OVERLAP_RATE = 0.65       # 0–1，对应 0%–100% 重叠
 ENABLE_SMART_PLANNING = True
 
-# Camera FOV (deg)
-CAMERA_HFOV = 84.0
-CAMERA_VFOV = 62.0
+# Camera FOV (deg)；M3E/M3T 广角典型 71.5°×56.8°（与 GUI 机型预设一致）
+CAMERA_HFOV = 71.5
+CAMERA_VFOV = 56.8
 
 # DJI / WPML params
 DRONE_TYPE = "M3T"
 AUTO_FLIGHT_SPEED = 4.0
+
+# Mavic 3 Enterprise series → FOV + WPML ids (verified for M3 line)
+DRONE_WPML_PROFILES: Dict[str, Dict[str, Any]] = {
+    "M3E": {
+        "hfov": 71.5, "vfov": 56.8,
+        "drone": "67", "drone_sub": "0", "payload": "52", "payload_sub": "0",
+    },
+    "M3T": {
+        "hfov": 71.5, "vfov": 56.8,
+        "drone": "67", "drone_sub": "1", "payload": "52", "payload_sub": "0",
+    },
+}
+
+WPML_DRONE_ENUM = "67"
+WPML_DRONE_SUB_ENUM = "1"
+WPML_PAYLOAD_ENUM = "52"
+WPML_PAYLOAD_SUB_ENUM = "0"
+
+
+def apply_drone_wpml_profile(drone_key: str) -> None:
+    """Set WPML enums and FOV/radians from presets (CLI / DRONE_TYPE)."""
+    global WPML_DRONE_ENUM, WPML_DRONE_SUB_ENUM, WPML_PAYLOAD_ENUM, WPML_PAYLOAD_SUB_ENUM
+    global CAMERA_HFOV, CAMERA_VFOV, HFOV_RAD, VFOV_RAD
+    p = DRONE_WPML_PROFILES.get(drone_key, DRONE_WPML_PROFILES["M3T"])
+    WPML_DRONE_ENUM = str(p["drone"])
+    WPML_DRONE_SUB_ENUM = str(p["drone_sub"])
+    WPML_PAYLOAD_ENUM = str(p["payload"])
+    WPML_PAYLOAD_SUB_ENUM = str(p["payload_sub"])
+    CAMERA_HFOV = float(p["hfov"])
+    CAMERA_VFOV = float(p["vfov"])
+    HFOV_RAD = radians(CAMERA_HFOV)
+    VFOV_RAD = radians(CAMERA_VFOV)
+
+
 GIMBAL_PITCH_DEG = 0.0     # level shot at each point
-HEADING_MODE = "UsePointSetting"
+# 机头模式（wpml:waypointHeadingMode）：
+# - followWayline：机头对准航迹方向，蛇形侧向段会左右偏航，费电费时
+# - fixed：完成航点动作后保持偏航飞往下一航点，侧飞时保持朝墙（依赖各点 rotateYaw）
+WAYPOINT_HEADING_MODE = "fixed"
 
 # Height reference modes
 # waylines.wpml (execution): "WGS84" or "relativeToStartPoint"
@@ -93,6 +137,13 @@ def egm96_geoid_offset(lat: float, lon: float) -> float:
 HFOV_RAD = radians(CAMERA_HFOV)
 VFOV_RAD = radians(CAMERA_VFOV)
 EARTH_R = 6378137.0
+
+# 四角是否接近矩形、是否共面（过严可调）
+FACADE_PLANE_MAX_RESIDUAL_M = 2.5
+FACADE_RECT_ANGLE_MIN_DEG = 68.0
+FACADE_RECT_ANGLE_MAX_DEG = 112.0
+FACADE_MIN_WIDTH_M = 2.0
+FACADE_MIN_HEIGHT_M = 2.0
 
 # ===================== EXIF GPS helpers ========================
 
@@ -146,7 +197,7 @@ def enu_to_geodetic(x, y, z, lat0, lon0, alt0):
 class FacadeTransformer:
     def __init__(self, gps4: List[Tuple[float, float, float]]):
         if len(gps4) != 4:
-            raise ValueError("需要 4 个点")
+            raise ValueError("Exactly 4 GPS points are required.")
         self.gps = gps4
         self.ref = gps4[0]
         self.enu = [geodetic_to_enu(lat, lon, alt, *self.ref) for (lat,lon,alt) in gps4]
@@ -189,7 +240,7 @@ class FacadeTransformer:
         wproj = sum(wvec[i]*yprime[i] for i in range(3))
         wplane = [wvec[i]-wproj*yprime[i] for i in range(3)]
         lwp = sqrt(sum(x*x for x in wplane))
-        if lwp<1e-9: raise ValueError("宽度向量与外立面垂直，无法确定X'")
+        if lwp<1e-9: raise ValueError("Width vector is degenerate relative to facade normal; cannot define X' axis.")
         xprime=[x/lwp for x in wplane]
         zprime=self._cross(xprime,yprime)
         if zprime[2]<0: zprime=[-z for z in zprime]; xprime=[-x for x in xprime]
@@ -209,6 +260,80 @@ class FacadeTransformer:
         x,y,z=self.facade_to_enu(fp)
         return enu_to_geodetic(x,y,z,*self.ref)
 
+
+def validate_planning_params() -> None:
+    """Enforce the same physical bounds as the GUI; raises ValueError with English messages."""
+    if not (PHOTO_DISTANCE_MIN <= PHOTO_DISTANCE <= PHOTO_DISTANCE_MAX):
+        raise ValueError(
+            f"Photo distance must be between {PHOTO_DISTANCE_MIN:.0f} and {PHOTO_DISTANCE_MAX:.0f} m (got {PHOTO_DISTANCE} m)."
+        )
+    if not (FLIGHT_DISTANCE_MIN <= FLIGHT_DISTANCE <= FLIGHT_DISTANCE_MAX):
+        raise ValueError(
+            f"Flight distance must be between {FLIGHT_DISTANCE_MIN:.0f} and {FLIGHT_DISTANCE_MAX:.0f} m (got {FLIGHT_DISTANCE} m)."
+        )
+    if not (AUTO_FLIGHT_SPEED_MIN <= AUTO_FLIGHT_SPEED <= AUTO_FLIGHT_SPEED_MAX):
+        raise ValueError(
+            f"Cruise speed must be between {AUTO_FLIGHT_SPEED_MIN} and {AUTO_FLIGHT_SPEED_MAX} m/s (got {AUTO_FLIGHT_SPEED} m/s)."
+        )
+    if not (0.0 <= OVERLAP_RATE <= 1.0):
+        raise ValueError("Overlap rate must be between 0% and 100% (inclusive).")
+
+
+def validate_facade_corner_geometry(tf: FacadeTransformer) -> None:
+    """
+    Require four corners to be nearly coplanar and form an ~rectangle in the facade X'–Z' plane.
+    Raises ValueError if they are unlikely to be valid facade corners.
+    """
+    a, b, c, d = tf.plane
+    denom = sqrt(a * a + b * b + c * c)
+    if denom < 1e-12:
+        raise ValueError("Could not fit a facade plane from GPS; check inputs.")
+    for i, enu in enumerate(tf.enu):
+        dist = abs(a * enu[0] + b * enu[1] + c * enu[2] + d) / denom
+        if dist > FACADE_PLANE_MAX_RESIDUAL_M:
+            raise ValueError(
+                f"A corner lies about {dist:.2f} m off the fitted facade plane "
+                f"(limit {FACADE_PLANE_MAX_RESIDUAL_M} m). Points may not lie on one facade or order is wrong."
+            )
+
+    pts = [(p[0], p[2]) for p in tf.facade_pts]
+    cx = sum(x for x, _ in pts) / 4.0
+    cz = sum(z for _, z in pts) / 4.0
+    ordered = sorted(pts, key=lambda xz: atan2(xz[1] - cz, xz[0] - cx))
+
+    def _interior_angle(i: int) -> float:
+        p0 = ordered[(i - 1) % 4]
+        p1 = ordered[i]
+        p2 = ordered[(i + 1) % 4]
+        v1 = (p0[0] - p1[0], p0[1] - p1[1])
+        v2 = (p2[0] - p1[0], p2[1] - p1[1])
+        n1 = hypot(*v1)
+        n2 = hypot(*v2)
+        if n1 < 1e-4 or n2 < 1e-4:
+            raise ValueError("Corners are nearly collinear on the facade plane; cannot form a quadrilateral.")
+        cosv = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
+        cosv = max(-1.0, min(1.0, cosv))
+        return degrees(acos(cosv))
+
+    angles = [_interior_angle(i) for i in range(4)]
+    for ang in angles:
+        if ang < FACADE_RECT_ANGLE_MIN_DEG or ang > FACADE_RECT_ANGLE_MAX_DEG:
+            raise ValueError(
+                f"Interior angles (deg) are {[round(a, 1) for a in angles]}; "
+                f"expected ~90° each (allowed {FACADE_RECT_ANGLE_MIN_DEG:.0f}°–{FACADE_RECT_ANGLE_MAX_DEG:.0f}°). "
+                "Corners may not match a rectangular facade."
+            )
+
+    xs = [x for x, _ in pts]
+    zs = [z for _, z in pts]
+    w = max(xs) - min(xs)
+    h = max(zs) - min(zs)
+    if w < FACADE_MIN_WIDTH_M or h < FACADE_MIN_HEIGHT_M:
+        raise ValueError(
+            f"Facade extent is only about {w:.2f} m × {h:.2f} m "
+            f"(minimum {FACADE_MIN_WIDTH_M} m × {FACADE_MIN_HEIGHT_M} m). Check corner positions or units."
+        )
+
 # ===================== Planning helpers ========================
 
 def fov_step(distance_m: float, fov_rad: float, overlap: float) -> float:
@@ -225,8 +350,10 @@ def plan_steps(direction: str, distance: float, overlap: float):
 # =================== Build mission & outputs ===================
 
 def build_waypoints_from_images(images: List[str]):
+    validate_planning_params()
     gps4=[read_gps(p) for p in images]
     tf=FacadeTransformer(gps4)
+    validate_facade_corner_geometry(tf)
 
     xs=[p[0] for p in tf.facade_pts]; zs=[p[2] for p in tf.facade_pts]
     w=max(xs)-min(xs); h=max(zs)-min(zs)
@@ -316,15 +443,15 @@ def build_waylines_wpml(tf: FacadeTransformer, wps: List[Tuple[float,float,float
     
     # Drone Info (use enum values)
     dinfo = SubElement(mcfg, "wpml:droneInfo")
-    SubElement(dinfo, "wpml:droneEnumValue").text = "67"  # M3T
-    SubElement(dinfo, "wpml:droneSubEnumValue").text = "1"
+    SubElement(dinfo, "wpml:droneEnumValue").text = WPML_DRONE_ENUM
+    SubElement(dinfo, "wpml:droneSubEnumValue").text = WPML_DRONE_SUB_ENUM
     
     SubElement(mcfg, "wpml:waylineAvoidLimitAreaMode").text = "0"
     
     # Payload Info
     pinfo = SubElement(mcfg, "wpml:payloadInfo")
-    SubElement(pinfo, "wpml:payloadEnumValue").text = "52"  # M3T camera
-    SubElement(pinfo, "wpml:payloadSubEnumValue").text = "0"
+    SubElement(pinfo, "wpml:payloadEnumValue").text = WPML_PAYLOAD_ENUM
+    SubElement(pinfo, "wpml:payloadSubEnumValue").text = WPML_PAYLOAD_SUB_ENUM
     SubElement(pinfo, "wpml:payloadPositionIndex").text = "0"
 
     # Folder with waypoints
@@ -374,7 +501,7 @@ def build_waylines_wpml(tf: FacadeTransformer, wps: List[Tuple[float,float,float
         
         # Waypoint heading param
         hparam = SubElement(pm, "wpml:waypointHeadingParam")
-        SubElement(hparam, "wpml:waypointHeadingMode").text = "followWayline"
+        SubElement(hparam, "wpml:waypointHeadingMode").text = WAYPOINT_HEADING_MODE
         SubElement(hparam, "wpml:waypointHeadingAngle").text = "0"
         SubElement(hparam, "wpml:waypointPoiPoint").text = "0.000000,0.000000,0.000000"
         SubElement(hparam, "wpml:waypointHeadingAngleEnable").text = "0"
@@ -465,15 +592,15 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
     
     # Drone Info (use enum values)
     dinfo = SubElement(mcfg, "wpml:droneInfo")
-    SubElement(dinfo, "wpml:droneEnumValue").text = "67"  # M3T
-    SubElement(dinfo, "wpml:droneSubEnumValue").text = "1"
+    SubElement(dinfo, "wpml:droneEnumValue").text = WPML_DRONE_ENUM
+    SubElement(dinfo, "wpml:droneSubEnumValue").text = WPML_DRONE_SUB_ENUM
     
     SubElement(mcfg, "wpml:waylineAvoidLimitAreaMode").text = "0"
     
     # Payload Info
     pinfo = SubElement(mcfg, "wpml:payloadInfo")
-    SubElement(pinfo, "wpml:payloadEnumValue").text = "52"  # M3T camera
-    SubElement(pinfo, "wpml:payloadSubEnumValue").text = "0"
+    SubElement(pinfo, "wpml:payloadEnumValue").text = WPML_PAYLOAD_ENUM
+    SubElement(pinfo, "wpml:payloadSubEnumValue").text = WPML_PAYLOAD_SUB_ENUM
     SubElement(pinfo, "wpml:payloadPositionIndex").text = "0"
 
     # Folder
@@ -497,7 +624,7 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
     
     # Global waypoint heading param
     ghparam = SubElement(folder, "wpml:globalWaypointHeadingParam")
-    SubElement(ghparam, "wpml:waypointHeadingMode").text = "followWayline"
+    SubElement(ghparam, "wpml:waypointHeadingMode").text = WAYPOINT_HEADING_MODE
     SubElement(ghparam, "wpml:waypointHeadingAngle").text = "0"
     SubElement(ghparam, "wpml:waypointPoiPoint").text = "0.000000,0.000000,0.000000"
     SubElement(ghparam, "wpml:waypointHeadingPathMode").text = "followBadArc"
@@ -545,7 +672,7 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
         
         # Waypoint heading param
         hparam = SubElement(pm, "wpml:waypointHeadingParam")
-        SubElement(hparam, "wpml:waypointHeadingMode").text = "followWayline"
+        SubElement(hparam, "wpml:waypointHeadingMode").text = WAYPOINT_HEADING_MODE
         SubElement(hparam, "wpml:waypointHeadingAngle").text = "0"
         SubElement(hparam, "wpml:waypointPoiPoint").text = "0.000000,0.000000,0.000000"
         SubElement(hparam, "wpml:waypointHeadingPathMode").text = "followBadArc"
@@ -653,6 +780,7 @@ def main(argv: List[str]):
 
     mission_name = sanitize_name(MISSION_NAME) or "Mission"
 
+    apply_drone_wpml_profile(DRONE_TYPE)
     print("Building facade mission...")
     tf, direction, wps = build_waypoints_from_images(images)
     print(f"Direction: {direction}, waypoints: {len(wps)}")

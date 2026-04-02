@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGroupBox, QLabel, QPushButton, QLineEdit, QDoubleSpinBox,
+    QGroupBox, QLabel, QPushButton, QLineEdit, QDoubleSpinBox, QSpinBox,
     QCheckBox, QComboBox, QTextEdit, QFileDialog, QMessageBox,
     QGridLayout, QFrame, QSizePolicy, QScrollArea
 )
@@ -190,6 +190,7 @@ class MainWindow(QMainWindow):
         self.generated_waypoints: List[Tuple[float, float, float]] = []
         self.transformer: Optional[core.FacadeTransformer] = None
         self.flight_direction: str = ""
+        self.corner_geometry_ok: bool = False
 
         # Central widget with scroll area
         scroll = QScrollArea()
@@ -211,7 +212,8 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        # Initial state
+        # Initial state (default M3T locks FOV from profile)
+        self._on_drone_type_changed()
         self._update_ui_state()
 
     # -------------------------------------------------------------------------
@@ -252,17 +254,19 @@ class MainWindow(QMainWindow):
 
         params.addWidget(QLabel("Photo Distance (m):"), 1, 0)
         self.spin_photo_dist = QDoubleSpinBox()
-        self.spin_photo_dist.setRange(0.1, 100.0)
+        self.spin_photo_dist.setRange(core.PHOTO_DISTANCE_MIN, core.PHOTO_DISTANCE_MAX)
         self.spin_photo_dist.setValue(5.0)
         self.spin_photo_dist.setDecimals(1)
+        self.spin_photo_dist.setToolTip(f"{core.PHOTO_DISTANCE_MIN:.0f}–{core.PHOTO_DISTANCE_MAX:.0f} m")
         self.spin_photo_dist.valueChanged.connect(self._on_param_changed)
         params.addWidget(self.spin_photo_dist, 1, 1)
 
         params.addWidget(QLabel("Flight Distance (m):"), 1, 2)
         self.spin_flight_dist = QDoubleSpinBox()
-        self.spin_flight_dist.setRange(0.1, 100.0)
+        self.spin_flight_dist.setRange(core.FLIGHT_DISTANCE_MIN, core.FLIGHT_DISTANCE_MAX)
         self.spin_flight_dist.setValue(5.0)
         self.spin_flight_dist.setDecimals(1)
+        self.spin_flight_dist.setToolTip(f"{core.FLIGHT_DISTANCE_MIN:.0f}–{core.FLIGHT_DISTANCE_MAX:.0f} m")
         self.spin_flight_dist.valueChanged.connect(self._on_param_changed)
         params.addWidget(self.spin_flight_dist, 1, 3)
 
@@ -277,35 +281,46 @@ class MainWindow(QMainWindow):
         group = QGroupBox("2. Camera & Planning Settings")
         layout = QGridLayout(group)
 
-        layout.addWidget(QLabel("HFOV (°):"), 0, 0)
+        layout.addWidget(QLabel("Drone Type:"), 0, 0)
+        self.combo_drone = QComboBox()
+        self.combo_drone.addItems(["M3E", "M3T"])
+        self.combo_drone.setCurrentText("M3T")
+        self.combo_drone.currentTextChanged.connect(self._on_drone_type_changed)
+        self.combo_drone.currentTextChanged.connect(self._on_param_changed)
+        layout.addWidget(self.combo_drone, 0, 1, 1, 3)
+
+        layout.addWidget(QLabel("HFOV (°):"), 1, 0)
         self.spin_hfov = QDoubleSpinBox()
         self.spin_hfov.setRange(1.0, 180.0)
-        self.spin_hfov.setValue(84.0)
+        self.spin_hfov.setValue(core.CAMERA_HFOV)
         self.spin_hfov.setDecimals(1)
         self.spin_hfov.valueChanged.connect(self._on_param_changed)
-        layout.addWidget(self.spin_hfov, 0, 1)
+        layout.addWidget(self.spin_hfov, 1, 1)
 
-        layout.addWidget(QLabel("VFOV (°):"), 0, 2)
+        layout.addWidget(QLabel("VFOV (°):"), 1, 2)
         self.spin_vfov = QDoubleSpinBox()
         self.spin_vfov.setRange(1.0, 180.0)
-        self.spin_vfov.setValue(62.0)
+        self.spin_vfov.setValue(core.CAMERA_VFOV)
         self.spin_vfov.setDecimals(1)
         self.spin_vfov.valueChanged.connect(self._on_param_changed)
-        layout.addWidget(self.spin_vfov, 0, 3)
+        layout.addWidget(self.spin_vfov, 1, 3)
 
-        layout.addWidget(QLabel("Overlap:"), 1, 0)
-        self.spin_overlap = QDoubleSpinBox()
-        self.spin_overlap.setRange(0.0, 0.99)
-        self.spin_overlap.setValue(0.65)
-        self.spin_overlap.setDecimals(2)
-        self.spin_overlap.setSingleStep(0.05)
+        layout.addWidget(QLabel("Overlap (%):"), 2, 0)
+        self.spin_overlap = QSpinBox()
+        self.spin_overlap.setRange(0, 100)
+        self.spin_overlap.setValue(65)
+        self.spin_overlap.setToolTip("Along-track photo overlap as percentage (0–100). Recommend ≥ 65.")
         self.spin_overlap.valueChanged.connect(self._on_param_changed)
-        layout.addWidget(self.spin_overlap, 1, 1)
+        layout.addWidget(self.spin_overlap, 2, 1)
+
+        lbl_overlap_hint = QLabel("Recommend ≥ 65%")
+        lbl_overlap_hint.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(lbl_overlap_hint, 2, 2, 1, 2)
 
         self.chk_smart_planning = QCheckBox("Enable Smart Planning")
         self.chk_smart_planning.setChecked(True)
         self.chk_smart_planning.stateChanged.connect(self._on_param_changed)
-        layout.addWidget(self.chk_smart_planning, 1, 2, 1, 2)
+        layout.addWidget(self.chk_smart_planning, 3, 0, 1, 4)
 
         return group
 
@@ -318,9 +333,10 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Speed (m/s):"), 0, 0)
         self.spin_speed = QDoubleSpinBox()
-        self.spin_speed.setRange(0.1, 15.0)
+        self.spin_speed.setRange(core.AUTO_FLIGHT_SPEED_MIN, core.AUTO_FLIGHT_SPEED_MAX)
         self.spin_speed.setValue(4.0)
         self.spin_speed.setDecimals(1)
+        self.spin_speed.setToolTip(f"{core.AUTO_FLIGHT_SPEED_MIN}–{core.AUTO_FLIGHT_SPEED_MAX} m/s")
         layout.addWidget(self.spin_speed, 0, 1)
 
         layout.addWidget(QLabel("Gimbal Pitch (°):"), 0, 2)
@@ -330,20 +346,15 @@ class MainWindow(QMainWindow):
         self.spin_gimbal.setDecimals(1)
         layout.addWidget(self.spin_gimbal, 0, 3)
 
-        layout.addWidget(QLabel("Drone Type:"), 1, 0)
-        self.combo_drone = QComboBox()
-        self.combo_drone.addItems(["M3T"])
-        layout.addWidget(self.combo_drone, 1, 1)
-
-        layout.addWidget(QLabel("Execute Height:"), 2, 0)
+        layout.addWidget(QLabel("Execute Height:"), 1, 0)
         self.combo_exec_height = QComboBox()
         self.combo_exec_height.addItems(["WGS84", "relativeToStartPoint"])
-        layout.addWidget(self.combo_exec_height, 2, 1)
+        layout.addWidget(self.combo_exec_height, 1, 1)
 
-        layout.addWidget(QLabel("Template Height:"), 2, 2)
+        layout.addWidget(QLabel("Template Height:"), 1, 2)
         self.combo_template_height = QComboBox()
         self.combo_template_height.addItems(["EGM96", "relativeToStartPoint"])
-        layout.addWidget(self.combo_template_height, 2, 3)
+        layout.addWidget(self.combo_template_height, 1, 3)
 
         return group
 
@@ -471,6 +482,7 @@ class MainWindow(QMainWindow):
         """Clear all loaded images."""
         self.image_paths = []
         self.gps_data = []
+        self.corner_geometry_ok = False
         self.drop_zone.clear()
         self.txt_info.clear()
         self._invalidate_generation()
@@ -480,9 +492,23 @@ class MainWindow(QMainWindow):
         """Handle parameter change - invalidate generation."""
         self._invalidate_generation()
 
+    def _on_drone_type_changed(self, _text: Optional[str] = None):
+        """M3 line presets: FOV fixed from profile, editors disabled."""
+        dt = self.combo_drone.currentText()
+        prof = core.DRONE_WPML_PROFILES[dt]
+        self.spin_hfov.blockSignals(True)
+        self.spin_vfov.blockSignals(True)
+        self.spin_hfov.setValue(float(prof["hfov"]))
+        self.spin_vfov.setValue(float(prof["vfov"]))
+        self.spin_hfov.blockSignals(False)
+        self.spin_vfov.blockSignals(False)
+        self.spin_hfov.setEnabled(False)
+        self.spin_vfov.setEnabled(False)
+
     def _extract_gps(self):
         """Extract GPS from loaded images."""
         self.gps_data = []
+        self.corner_geometry_ok = False
         info_lines = []
 
         for i, path in enumerate(self.image_paths):
@@ -499,15 +525,19 @@ class MainWindow(QMainWindow):
                 info_lines.append(f"Photo {i+1}: ERROR - {str(e)}")
                 self.gps_data.append(None)
 
-        # Calculate facade info if all 4 valid
+        # Facade geometry + near-rectangle corners (blocks Generate if invalid)
         if len(self.gps_data) == 4 and all(g is not None for g in self.gps_data):
             try:
                 tf = core.FacadeTransformer(self.gps_data)
+                core.validate_facade_corner_geometry(tf)
+                self.corner_geometry_ok = True
                 xs = [p[0] for p in tf.facade_pts]
                 zs = [p[2] for p in tf.facade_pts]
                 width = max(xs) - min(xs)
                 height = max(zs) - min(zs)
                 info_lines.append(f"\nFacade: {width:.1f}m × {height:.1f}m")
+            except ValueError as e:
+                info_lines.append(f"\nGeometry check failed: {e}")
             except Exception as e:
                 info_lines.append(f"\nFacade analysis error: {str(e)}")
 
@@ -540,12 +570,18 @@ class MainWindow(QMainWindow):
             core.CAMERA_VFOV = self.spin_vfov.value()
             core.HFOV_RAD = core.radians(core.CAMERA_HFOV)
             core.VFOV_RAD = core.radians(core.CAMERA_VFOV)
-            core.OVERLAP_RATE = self.spin_overlap.value()
+            core.OVERLAP_RATE = self.spin_overlap.value() / 100.0
             core.ENABLE_SMART_PLANNING = self.chk_smart_planning.isChecked()
             core.AUTO_FLIGHT_SPEED = self.spin_speed.value()
             core.GIMBAL_PITCH_DEG = self.spin_gimbal.value()
             core.EXECUTE_HEIGHT_MODE = self.combo_exec_height.currentText()
             core.TEMPLATE_HEIGHT_MODE = self.combo_template_height.currentText()
+            core.DRONE_TYPE = self.combo_drone.currentText()
+            prof = core.DRONE_WPML_PROFILES[core.DRONE_TYPE]
+            core.WPML_DRONE_ENUM = str(prof["drone"])
+            core.WPML_DRONE_SUB_ENUM = str(prof["drone_sub"])
+            core.WPML_PAYLOAD_ENUM = str(prof["payload"])
+            core.WPML_PAYLOAD_SUB_ENUM = str(prof["payload_sub"])
 
             # Generate
             self.transformer, self.flight_direction, self.generated_waypoints = \
@@ -615,7 +651,11 @@ class MainWindow(QMainWindow):
 
     def _update_ui_state(self):
         """Update UI enabled/disabled states."""
-        has_4_images = len(self.image_paths) == 4 and all(g is not None for g in self.gps_data)
+        has_4_images = (
+            len(self.image_paths) == 4
+            and all(g is not None for g in self.gps_data)
+            and self.corner_geometry_ok
+        )
         has_generation = len(self.generated_waypoints) > 0
 
         self.btn_generate.setEnabled(has_4_images)
@@ -624,7 +664,10 @@ class MainWindow(QMainWindow):
         self.btn_save_both.setEnabled(has_generation)
 
         if not has_4_images:
-            self.lbl_gen_status.setText("Status: Load 4 valid images to enable generation")
+            if len(self.image_paths) == 4 and all(g is not None for g in self.gps_data) and not self.corner_geometry_ok:
+                self.lbl_gen_status.setText("Status: Corner geometry check failed — see panel below.")
+            else:
+                self.lbl_gen_status.setText("Status: Load 4 valid images to enable generation")
             self.lbl_gen_status.setStyleSheet("color: #888;")
 
 
