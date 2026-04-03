@@ -23,10 +23,11 @@ For EGM96, plug your geoid model in `egm96_geoid_offset(lat, lon)`.
 
 import sys
 import exifread
-from math import radians, cos, tan, sqrt, degrees, atan2, acos, hypot
+import os
+from math import radians, cos, tan, sqrt, degrees, atan2, hypot
 from pathlib import Path
 from xml.etree.ElementTree import Element, SubElement, ElementTree, tostring
-from typing import Dict, List, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
 import zipfile
 import io
 import numpy as np
@@ -139,12 +140,32 @@ HFOV_RAD = radians(CAMERA_HFOV)
 VFOV_RAD = radians(CAMERA_VFOV)
 EARTH_R = 6378137.0
 
-# 四角是否接近矩形、是否共面（过严可调）
+# 四角共面 + 立面四边形（允许轻微直角梯形，不再要求四角近 90°）
 FACADE_PLANE_MAX_RESIDUAL_M = 2.5
-FACADE_RECT_ANGLE_MIN_DEG = 68.0
-FACADE_RECT_ANGLE_MAX_DEG = 112.0
 FACADE_MIN_WIDTH_M = 2.0
 FACADE_MIN_HEIGHT_M = 2.0
+
+# X′–Z′ 投影上：左右边近竖直、顶边近水平、底边可斜但不可近竖直或退化
+FACADE_LR_VERTICAL_MIN_DZ_OVER_DX = 2.0  # 左/右边：|Δz| ≥ 此值 × |Δx|（水平分量极小时另见 EPS）
+FACADE_TOP_HORIZONTAL_MIN_DX_OVER_DZ = 2.0  # 顶边：|Δx| ≥ 此值 × |Δz|
+FACADE_BOTTOM_MAX_DZ_OVER_DX = 5.0  # 底边：若 |Δz| > 此值 × |Δx| 视为近竖直，拒绝
+FACADE_DIR_RATIO_EPS_M = 0.08  # 比值判定时对 |Δx|/|Δz| 的下限钳制，避免除零
+
+# 顶整体高于底、面积与边长
+FACADE_TOP_BOTTOM_MIN_Z_SEP_M = 0.35  # mean(z_top) − mean(z_bot) 下限（m）
+FACADE_MIN_QUAD_AREA_M2 = 3.0  # 四边形有向面积绝对值下限（m²）
+FACADE_MIN_EDGE_LEN_M = 0.35  # 任一边投影长度下限（m）
+
+# 对边是否真正相交（蝴蝶结）：叉积相对尺度 + 参数 t,u 开区间容差
+FACADE_SEG_CROSS_REL_EPS = 1e-10
+FACADE_SEG_OPEN_TOL = 1e-9
+
+# Raw input order diagnostic (soft warning only; semantic reassignment is still the source of truth)
+FACADE_RAW_ORDER_SIDE_MARGIN_FRAC = 0.03       # x-side separation tolerance as fraction of facade width in X′
+FACADE_RAW_ORDER_VERTICAL_TOL_FRAC = 0.02     # z-top/bottom tolerance as fraction of facade height in Z′
+
+# Temporary debug: set to 1 (or export env var) to print raw-order diagnostics.
+FACADE_RAW_ORDER_DIAG_DEBUG = os.environ.get("FACADE_RAW_ORDER_DIAG_DEBUG", "0") == "1"
 
 # ===================== EXIF GPS helpers ========================
 
@@ -198,6 +219,14 @@ def enu_to_geodetic(x, y, z, lat0, lon0, alt0):
     return lat, lon, alt
 
 class FacadeTransformer:
+    """
+    Expects four facade-corner camera positions in ENU order:
+      index 0 = bottom-left, 1 = top-left, 2 = top-right, 3 = bottom-right
+    as seen when **facing the wall** (camera outside, CCW on the wall).
+    That order makes (p1-p0)×(p2-p1) point from the wall toward the camera;
+    +Y' is aligned to **toward the building** (opposite), for RTK offset math.
+    """
+
     def __init__(self, gps4: List[Tuple[float, float, float]]):
         logger.info("Initializing FacadeTransformer with 4 GPS points")
         if len(gps4) != 4:
@@ -233,6 +262,47 @@ class FacadeTransformer:
             if err<best_err: best_err, best_n = err, n
         d = -(best_n[0]*cx + best_n[1]*cy + best_n[2]*cz)
         return [best_n[0], best_n[1], best_n[2], d]
+
+    def _ensure_yprime_toward_building(
+        self, xprime: List[float], yprime: List[float], zprime: List[float]
+    ) -> Tuple[List[float], List[float], List[float]]:
+        """
+        Using corner order BL(0)→TL(1)→TR(2) as CCW on the wall from outside:
+        u×v points outward (toward camera). +Y' must be toward building (−horizontal part when vertical).
+        """
+        u = [self.enu[1][i] - self.enu[0][i] for i in range(3)]
+        v = [self.enu[2][i] - self.enu[1][i] for i in range(3)]
+        n_out = self._cross(u, v)
+        ln = sqrt(sum(x * x for x in n_out))
+        if ln < 1e-9:
+            logger.warning(
+                "Degenerate edge cross (BL→TL)×(TL→TR); cannot verify Y' sign from corner order"
+            )
+            return xprime, yprime, zprime
+        n_out = [x / ln for x in n_out]
+
+        if FORCE_VERTICAL_PLANE:
+            y_toward_b = [-n_out[0], -n_out[1], 0.0]
+            lh = sqrt(y_toward_b[0] ** 2 + y_toward_b[1] ** 2)
+            if lh < 1e-9:
+                logger.warning("Wall outward normal has no horizontal part; skip Y' alignment")
+                return xprime, yprime, zprime
+            y_toward_b = [y_toward_b[0] / lh, y_toward_b[1] / lh, 0.0]
+        else:
+            y_toward_b = [-n_out[0], -n_out[1], -n_out[2]]
+            lb = sqrt(sum(x * x for x in y_toward_b))
+            if lb < 1e-9:
+                return xprime, yprime, zprime
+            y_toward_b = [x / lb for x in y_toward_b]
+
+        dotp = sum(yprime[i] * y_toward_b[i] for i in range(3))
+        if dotp < 0:
+            logger.info(
+                "Adjusted X'/Y' so +Y' points toward building (CCW corner order from camera)"
+            )
+            xprime = [-x for x in xprime]
+            yprime = [-y for y in yprime]
+        return xprime, yprime, zprime
 
     def _build(self):
         logger.debug("Fitting plane to camera positions")
@@ -270,6 +340,8 @@ class FacadeTransformer:
             zprime=self._cross(xprime,yprime)
             if zprime[2]<0: zprime=[-z for z in zprime]; xprime=[-x for x in xprime]
             logger.debug(f"Tilted plane - Z': [{zprime[0]:.4f}, {zprime[1]:.4f}, {zprime[2]:.4f}]")
+
+        xprime, yprime, zprime = self._ensure_yprime_toward_building(xprime, yprime, zprime)
         self.R=[xprime,yprime,zprime]
         self.origin=[sum(p[i] for p in self.enu)/4.0 for i in range(3)]
         self.plane=[a,b,c,d]
@@ -306,9 +378,165 @@ def validate_planning_params() -> None:
         raise ValueError("Overlap rate must be between 0% and 100% (inclusive).")
 
 
+def _cross2(ax: float, az: float, bx: float, bz: float) -> float:
+    return ax * bz - az * bx
+
+
+def _seg_proper_intersect_2d(
+    ax: float,
+    az: float,
+    bx: float,
+    bz: float,
+    cx: float,
+    cz: float,
+    dx: float,
+    dz: float,
+) -> bool:
+    """True if open segments (a→b) and (c→d) intersect in the interior (not only at endpoints)."""
+    rx, rz = bx - ax, bz - az
+    sx, sz = dx - cx, dz - cz
+    qx, qz = cx - ax, cz - az
+    rxs = _cross2(rx, rz, sx, sz)
+    scale = hypot(rx, rz) * hypot(sx, sz) + 1e-12
+    if abs(rxs) <= FACADE_SEG_CROSS_REL_EPS * scale:
+        return False
+    t = _cross2(qx, qz, sx, sz) / rxs
+    u = _cross2(qx, qz, rx, rz) / rxs
+    tol = FACADE_SEG_OPEN_TOL
+    return tol < t < 1.0 - tol and tol < u < 1.0 - tol
+
+
+def _assign_facade_semantic_corners_xz(
+    pts_xz: List[Tuple[float, float]],
+) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float], Tuple[float, float]]:
+    """
+    Map four (x,z) samples to semantic corners without polar sorting:
+    split left/right by X′ (two smaller X → left wall edge), then top/bottom by Z′ on each side.
+    Returns (left_bottom, left_top, right_top, right_bottom).
+    """
+    if len(pts_xz) != 4:
+        raise ValueError("Exactly 4 facade (x,z) points are required.")
+    order_by_x = sorted(range(4), key=lambda i: (pts_xz[i][0], pts_xz[i][1], i))
+    left_i = order_by_x[:2]
+    right_i = order_by_x[2:]
+    left_i = sorted(left_i, key=lambda i: pts_xz[i][1])
+    right_i = sorted(right_i, key=lambda i: pts_xz[i][1])
+    lb = pts_xz[left_i[0]]
+    lt = pts_xz[left_i[1]]
+    rb = pts_xz[right_i[0]]
+    rt = pts_xz[right_i[1]]
+    return lb, lt, rt, rb
+
+
+def _quad_polygon_area_xz(corners: List[Tuple[float, float]]) -> float:
+    """Shoelace area for polygon given in order (CCW or CW); returns absolute area."""
+    n = len(corners)
+    s = 0.0
+    for i in range(n):
+        x0, z0 = corners[i]
+        x1, z1 = corners[(i + 1) % n]
+        s += x0 * z1 - x1 * z0
+    return abs(s) * 0.5
+
+
+def _diagnose_raw_corner_order_consistency_xz(
+    pts_xz: List[Tuple[float, float]],
+) -> Tuple[bool, Optional[str]]:
+    """
+    Soft diagnostic only (no hard failure).
+
+    Raw input is expected as: BL -> TL -> TR -> BR
+    in tf.facade_pts order (indices 0..3). We check whether the raw order
+    is consistent in X′–Z′ space; otherwise return a warning message.
+    """
+    if len(pts_xz) != 4:
+        return True, None
+
+    # Raw mapping (by tf.facade_pts indices)
+    lb = pts_xz[0]
+    lt = pts_xz[1]
+    rt = pts_xz[2]
+    rb = pts_xz[3]
+
+    if FACADE_RAW_ORDER_DIAG_DEBUG:
+        print("\n[RAW_ORDER_DIAG] incoming raw pts_xz by index:")
+        for idx, (xv, zv) in enumerate(pts_xz):
+            print(f"  idx {idx}: X'={xv:.4f}, Z'={zv:.4f}")
+        print("[RAW_ORDER_DIAG] interpreted as:")
+        print(f"  BL (idx0): X'={lb[0]:.4f}, Z'={lb[1]:.4f}")
+        print(f"  TL (idx1): X'={lt[0]:.4f}, Z'={lt[1]:.4f}")
+        print(f"  TR (idx2): X'={rt[0]:.4f}, Z'={rt[1]:.4f}")
+        print(f"  BR (idx3): X'={rb[0]:.4f}, Z'={rb[1]:.4f}")
+
+    xs = [p[0] for p in pts_xz]
+    zs = [p[1] for p in pts_xz]
+    w = max(xs) - min(xs)
+    h = max(zs) - min(zs)
+    w = w if w > 1e-12 else 1.0
+    h = h if h > 1e-12 else 1.0
+
+    side_margin = FACADE_RAW_ORDER_SIDE_MARGIN_FRAC * w
+    vert_tol = FACADE_RAW_ORDER_VERTICAL_TOL_FRAC * h
+
+    avg_x_left = 0.5 * (lb[0] + lt[0])
+    avg_x_right = 0.5 * (rt[0] + rb[0])
+    avg_z_top = 0.5 * (lt[1] + rt[1])
+    avg_z_bot = 0.5 * (lb[1] + rb[1])
+
+    # 1. BL & TL should be on the left side overall
+    cond1 = max(lb[0], lt[0]) <= min(rt[0], rb[0]) + side_margin
+    # 2. TR & BR should be on the right side overall
+    cond2 = min(rt[0], rb[0]) >= max(lb[0], lt[0]) - side_margin
+    # 3. TL should be above BL in Z′
+    cond3 = lt[1] >= lb[1] - vert_tol
+    # 4. TR should be above BR in Z′
+    cond4 = rt[1] >= rb[1] - vert_tol
+    # 5. average(top corners) above average(bottom corners)
+    cond5 = avg_z_top >= avg_z_bot - vert_tol
+    # 6. average(left corners) should have smaller X′ than average(right corners)
+    cond6 = avg_x_left < avg_x_right + side_margin
+
+    conds = [cond1, cond2, cond3, cond4, cond5, cond6]
+    if all(conds):
+        return True, None
+
+    if FACADE_RAW_ORDER_DIAG_DEBUG:
+        print("[RAW_ORDER_DIAG] computed scale/thresholds:")
+        print(f"  w(X')={w:.4f}, h(Z')={h:.4f}")
+        print(f"  side_margin={side_margin:.4f}, vert_tol={vert_tol:.4f}")
+        print("[RAW_ORDER_DIAG] condition results:")
+        print(f"  cond1 (left side): {cond1} ; max(leftX)={max(lb[0], lt[0]):.4f}, min(rightX)={min(rt[0], rb[0]):.4f}")
+        print(f"  cond2 (right side): {cond2} ; min(rightX)={min(rt[0], rb[0]):.4f}, max(leftX)={max(lb[0], lt[0]):.4f}")
+        print(f"  cond3 (TL above BL): {cond3} ; TL_Z'={lt[1]:.4f}, BL_Z'={lb[1]:.4f}")
+        print(f"  cond4 (TR above BR): {cond4} ; TR_Z'={rt[1]:.4f}, BR_Z'={rb[1]:.4f}")
+        print(f"  cond5 (avg top above avg bottom): {cond5} ; avg_top_Z'={avg_z_top:.4f}, avg_bot_Z'={avg_z_bot:.4f}")
+        print(f"  cond6 (avg left X' < avg right X'): {cond6} ; avg_left_X'={avg_x_left:.4f}, avg_right_X'={avg_x_right:.4f}")
+
+    violated = [str(i + 1) for i, ok in enumerate(conds) if not ok]
+
+    likely_causes: List[str] = []
+    if not cond6 and avg_x_left > avg_x_right + side_margin * 0.5:
+        likely_causes.append("possible left-right swap")
+    if not cond3:
+        likely_causes.append("possible BL/TL swap")
+    if not cond4:
+        likely_causes.append("possible TR/BR swap")
+
+    if not likely_causes:
+        likely_causes.append("raw order inconsistent with expected BL->TL->TR->BR")
+
+    msg = (
+        "Raw corner order BL->TL->TR->BR looks inconsistent in X′–Z′ projection "
+        f"(violated: {', '.join(violated)}). Likely: {', '.join(likely_causes)}. "
+        "Planner will continue using geometry-based semantic reassignment (no hard fail)."
+    )
+    return False, msg
+
+
 def validate_facade_corner_geometry(tf: FacadeTransformer) -> None:
     """
-    Require four corners to be nearly coplanar and form an ~rectangle in the facade X'–Z' plane.
+    Require four corners to be nearly coplanar and form a simple vertical-facade quadrilateral
+    in the X′–Z′ plane: left/right edges ~vertical, top ~horizontal, bottom may be slanted.
     Raises ValueError if they are unlikely to be valid facade corners.
     """
     a, b, c, d = tf.plane
@@ -324,33 +552,6 @@ def validate_facade_corner_geometry(tf: FacadeTransformer) -> None:
             )
 
     pts = [(p[0], p[2]) for p in tf.facade_pts]
-    cx = sum(x for x, _ in pts) / 4.0
-    cz = sum(z for _, z in pts) / 4.0
-    ordered = sorted(pts, key=lambda xz: atan2(xz[1] - cz, xz[0] - cx))
-
-    def _interior_angle(i: int) -> float:
-        p0 = ordered[(i - 1) % 4]
-        p1 = ordered[i]
-        p2 = ordered[(i + 1) % 4]
-        v1 = (p0[0] - p1[0], p0[1] - p1[1])
-        v2 = (p2[0] - p1[0], p2[1] - p1[1])
-        n1 = hypot(*v1)
-        n2 = hypot(*v2)
-        if n1 < 1e-4 or n2 < 1e-4:
-            raise ValueError("Corners are nearly collinear on the facade plane; cannot form a quadrilateral.")
-        cosv = (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)
-        cosv = max(-1.0, min(1.0, cosv))
-        return degrees(acos(cosv))
-
-    angles = [_interior_angle(i) for i in range(4)]
-    for ang in angles:
-        if ang < FACADE_RECT_ANGLE_MIN_DEG or ang > FACADE_RECT_ANGLE_MAX_DEG:
-            raise ValueError(
-                f"Interior angles (deg) are {[round(a, 1) for a in angles]}; "
-                f"expected ~90° each (allowed {FACADE_RECT_ANGLE_MIN_DEG:.0f}°–{FACADE_RECT_ANGLE_MAX_DEG:.0f}°). "
-                "Corners may not match a rectangular facade."
-            )
-
     xs = [x for x, _ in pts]
     zs = [z for _, z in pts]
     w = max(xs) - min(xs)
@@ -359,6 +560,105 @@ def validate_facade_corner_geometry(tf: FacadeTransformer) -> None:
         raise ValueError(
             f"Facade extent is only about {w:.2f} m × {h:.2f} m "
             f"(minimum {FACADE_MIN_WIDTH_M} m × {FACADE_MIN_HEIGHT_M} m). Check corner positions or units."
+        )
+
+    raw_ok, raw_warn = _diagnose_raw_corner_order_consistency_xz(pts)
+    # Expose for potential debugging; does not change validation behavior.
+    tf.raw_order_consistent = raw_ok  # type: ignore[attr-defined]
+    tf.raw_order_warning = raw_warn  # type: ignore[attr-defined]
+    if raw_warn:
+        logger.warning(raw_warn)
+        # Also print so users can observe soft warnings even if log level/filter hides them.
+        print(f"[RAW_ORDER_WARNING] {raw_warn}")
+
+    lb, lt, rt, rb = _assign_facade_semantic_corners_xz(pts)
+
+    # Non-self-intersecting: opposite edges of (lb → lt → rt → rb) must not cross in the interior
+    if _seg_proper_intersect_2d(lb[0], lb[1], lt[0], lt[1], rt[0], rt[1], rb[0], rb[1]):
+        raise ValueError(
+            "Facade corners form a self-intersecting quadrilateral in the X′–Z′ plane (bow-tie); "
+            "check GPS or corner assignment."
+        )
+    if _seg_proper_intersect_2d(lt[0], lt[1], rt[0], rt[1], rb[0], rb[1], lb[0], lb[1]):
+        raise ValueError(
+            "Facade corners form a self-intersecting quadrilateral in the X′–Z′ plane (bow-tie); "
+            "check GPS or corner assignment."
+        )
+
+    # Edge vectors (semantic naming)
+    v_left = (lt[0] - lb[0], lt[1] - lb[1])
+    v_right = (rt[0] - rb[0], rt[1] - rb[1])
+    v_top = (rt[0] - lt[0], rt[1] - lt[1])
+    v_bot = (rb[0] - lb[0], rb[1] - lb[1])
+
+    def _len_xz(v: Tuple[float, float]) -> float:
+        return hypot(v[0], v[1])
+
+    lens = [_len_xz(v_left), _len_xz(v_right), _len_xz(v_top), _len_xz(v_bot)]
+    min_len = min(lens)
+    if min_len < FACADE_MIN_EDGE_LEN_M:
+        raise ValueError(
+            f"Shortest facade edge in X′–Z′ projection is about {min_len:.2f} m "
+            f"(minimum {FACADE_MIN_EDGE_LEN_M} m); corners may be degenerate."
+        )
+
+    def _ratio_vertical_ok(dx: float, dz: float) -> bool:
+        """Left/right: |dz| should dominate |dx|."""
+        adx, adz = abs(dx), abs(dz)
+        return adz >= FACADE_LR_VERTICAL_MIN_DZ_OVER_DX * max(adx, FACADE_DIR_RATIO_EPS_M)
+
+    def _ratio_horizontal_ok(dx: float, dz: float) -> bool:
+        """Top: |dx| should dominate |dz|."""
+        adx, adz = abs(dx), abs(dz)
+        return adx >= FACADE_TOP_HORIZONTAL_MIN_DX_OVER_DZ * max(adz, FACADE_DIR_RATIO_EPS_M)
+
+    def _bottom_not_near_vertical(dx: float, dz: float) -> bool:
+        """Bottom may slope; reject if nearly vertical (|dz| >> |dx|) or near-point."""
+        adx, adz = abs(dx), abs(dz)
+        if adx < FACADE_DIR_RATIO_EPS_M and adz < FACADE_DIR_RATIO_EPS_M:
+            return False
+        if adx < FACADE_DIR_RATIO_EPS_M:
+            return False
+        return adz <= FACADE_BOTTOM_MAX_DZ_OVER_DX * adx
+
+    if not _ratio_vertical_ok(*v_left):
+        raise ValueError(
+            "Left facade edge is not sufficiently vertical in the X′–Z′ plane "
+            f"(|Δz| should be ≥ {FACADE_LR_VERTICAL_MIN_DZ_OVER_DX:g}× effective |Δx|). "
+            "Check corner positions or GPS noise."
+        )
+    if not _ratio_vertical_ok(*v_right):
+        raise ValueError(
+            "Right facade edge is not sufficiently vertical in the X′–Z′ plane "
+            f"(|Δz| should be ≥ {FACADE_LR_VERTICAL_MIN_DZ_OVER_DX:g}× effective |Δx|). "
+            "Check corner positions or GPS noise."
+        )
+    if not _ratio_horizontal_ok(*v_top):
+        raise ValueError(
+            "Top facade edge is not sufficiently horizontal in the X′–Z′ plane "
+            f"(|Δx| should be ≥ {FACADE_TOP_HORIZONTAL_MIN_DX_OVER_DZ:g}× effective |Δz|). "
+            "Check corner positions or GPS noise."
+        )
+    if not _bottom_not_near_vertical(*v_bot):
+        raise ValueError(
+            "Bottom facade edge is too steep (nearly vertical) or degenerate in the X′–Z′ plane; "
+            "a slanted bottom is allowed but it must retain a clear horizontal run."
+        )
+
+    z_top_mean = (lt[1] + rt[1]) * 0.5
+    z_bot_mean = (lb[1] + rb[1]) * 0.5
+    if z_top_mean < z_bot_mean + FACADE_TOP_BOTTOM_MIN_Z_SEP_M:
+        raise ValueError(
+            f"Top of facade is not clearly above bottom in Z′ "
+            f"(mean top − mean bottom = {z_top_mean - z_bot_mean:.2f} m, "
+            f"need ≥ {FACADE_TOP_BOTTOM_MIN_Z_SEP_M} m)."
+        )
+
+    area = _quad_polygon_area_xz([lb, lt, rt, rb])
+    if area < FACADE_MIN_QUAD_AREA_M2:
+        raise ValueError(
+            f"Facade quadrilateral area in X′–Z′ is only about {area:.2f} m² "
+            f"(minimum {FACADE_MIN_QUAD_AREA_M2} m²)."
         )
 
 # ===================== Planning helpers ========================
@@ -402,10 +702,10 @@ def build_waypoints_from_images(images: List[str]):
     minx,maxx=min(xs),max(xs); minz,maxz=min(zs),max(zs)
     yps=[p[1] for p in tf.facade_pts]
     avg_y = sum(yps)/len(yps)
-    # RTK workflow: Y' points toward facade (building)
-    # - Camera positions are at Y' ≈ 0 (centered at origin)
-    # - Facade surface is at Y' = avg_y + PHOTO_DISTANCE (toward building)
-    # - Flight plane is at Y' = facade - FLIGHT_DISTANCE (between camera and facade)
+    # Origin = centroid of the four cameras → sum(facade_pts)==0 ⇒ avg_y ≈ 0.
+    # +Y' = toward building (enforced from BL→TL→TR CCW order in FacadeTransformer).
+    # Wall ≈ +PHOTO_DISTANCE along Y' from camera plane; flight line F m in front of wall:
+    # safe_y ≈ PHOTO_DISTANCE - FLIGHT_DISTANCE.
     safe_y = avg_y + PHOTO_DISTANCE - FLIGHT_DISTANCE
     logger.info(f"RTK offset: camera Y'={avg_y:.2f}m, photo_dist={PHOTO_DISTANCE}m, flight_dist={FLIGHT_DISTANCE}m → flight Y'={safe_y:.2f}m")
 

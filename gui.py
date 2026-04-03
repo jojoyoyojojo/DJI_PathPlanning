@@ -13,7 +13,7 @@ Provides a desktop interface for the drone mission planning tool with:
 import sys
 import os
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -30,152 +30,187 @@ import mavic3T_pp_kmz as core
 
 
 # =============================================================================
-# Drop Zone Widget
+# Facade corner slots (2×2, facing the wall) → core order [BL, TL, TR, BR]
 # =============================================================================
 
-class DropZone(QFrame):
-    """Widget that accepts drag-and-drop of images or folders."""
+# Slot indices match mavic3T_pp_kmz.FacadeTransformer: 0=BL, 1=TL, 2=TR, 3=BR
 
-    images_dropped = Signal(list)  # Emits list of file paths
 
-    def __init__(self, parent=None):
+class FacadeCornerSlot(QFrame):
+    """Single corner cell: drop one JPG/JPEG here."""
+
+    image_dropped = Signal(int, str)  # slot_index, path
+
+    def __init__(self, slot_index: int, title: str, parent=None):
         super().__init__(parent)
+        self.slot_index = slot_index
         self.setAcceptDrops(True)
-        self.setMinimumHeight(150)
-        self.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
+        self.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
+        self.setMinimumSize(108, 118)
         self.setStyleSheet("""
-            DropZone {
-                background-color: #f5f5f5;
-                border: 2px dashed #aaa;
-                border-radius: 8px;
+            FacadeCornerSlot {
+                background-color: #fafafa;
+                border: 2px dashed #bbb;
+                border-radius: 6px;
             }
-            DropZone[drag_over="true"] {
+            FacadeCornerSlot[drag_over="true"] {
                 background-color: #e3f2fd;
                 border-color: #2196f3;
             }
         """)
 
-        # Layout
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignCenter)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(4)
+        self._title = QLabel(title)
+        self._title.setAlignment(Qt.AlignCenter)
+        self._title.setStyleSheet("font-size: 11px; font-weight: bold; color: #333;")
+        lay.addWidget(self._title)
 
-        # Thumbnail grid
-        self.thumb_layout = QHBoxLayout()
-        self.thumb_layout.setSpacing(10)
-        self.thumb_layout.setAlignment(Qt.AlignCenter)
+        self.thumb = QLabel()
+        self.thumb.setFixedSize(72, 72)
+        self.thumb.setFrameStyle(QFrame.Box | QFrame.Plain)
+        self.thumb.setAlignment(Qt.AlignCenter)
+        self.thumb.setStyleSheet("background-color: #eee; border: 1px solid #ccc; color: #999;")
+        self.thumb.setText("—")
+        lay.addWidget(self.thumb, alignment=Qt.AlignCenter)
 
-        self.thumb_labels: List[QLabel] = []
-        self.name_labels: List[QLabel] = []
-
-        for i in range(4):
-            container = QVBoxLayout()
-
-            thumb = QLabel()
-            thumb.setFixedSize(64, 64)
-            thumb.setFrameStyle(QFrame.Box)
-            thumb.setAlignment(Qt.AlignCenter)
-            thumb.setStyleSheet("background-color: #ddd; border: 1px solid #bbb;")
-            thumb.setText(f"{i+1}")
-            self.thumb_labels.append(thumb)
-
-            name = QLabel("Empty")
-            name.setFixedWidth(80)
-            name.setAlignment(Qt.AlignCenter)
-            name.setStyleSheet("font-size: 10px; color: #666;")
-            self.name_labels.append(name)
-
-            container.addWidget(thumb, alignment=Qt.AlignCenter)
-            container.addWidget(name, alignment=Qt.AlignCenter)
-            self.thumb_layout.addLayout(container)
-
-        layout.addLayout(self.thumb_layout)
-
-        # Instruction label
-        self.instruction = QLabel("Drop images or folder here")
-        self.instruction.setStyleSheet("color: #888; font-size: 12px;")
-        self.instruction.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.instruction)
+        self.name_lbl = QLabel("Empty")
+        self.name_lbl.setAlignment(Qt.AlignCenter)
+        self.name_lbl.setWordWrap(True)
+        self.name_lbl.setStyleSheet("font-size: 9px; color: #666; max-width: 96px;")
+        lay.addWidget(self.name_lbl)
 
         self._drag_over = False
 
-    def set_drag_over(self, value: bool):
-        self._drag_over = value
-        self.setProperty("drag_over", value)
+    def _set_drag_over(self, on: bool):
+        self._drag_over = on
+        self.setProperty("drag_over", on)
         self.style().unpolish(self)
         self.style().polish(self)
+
+    def set_path(self, path: Optional[str]) -> None:
+        if path and os.path.isfile(path):
+            pix = QPixmap(path)
+            if not pix.isNull():
+                self.thumb.setPixmap(
+                    pix.scaled(72, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+            else:
+                self.thumb.clear()
+                self.thumb.setText("ERR")
+            self.name_lbl.setText(Path(path).name[:16])
+        else:
+            self.thumb.clear()
+            self.thumb.setText("—")
+            self.name_lbl.setText("Empty")
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
-            self.set_drag_over(True)
+            self._set_drag_over(True)
 
     def dragLeaveEvent(self, event):
-        self.set_drag_over(False)
+        self._set_drag_over(False)
 
     def dropEvent(self, event: QDropEvent):
-        self.set_drag_over(False)
-        urls = event.mimeData().urls()
-        paths = []
-
-        for url in urls:
+        self._set_drag_over(False)
+        for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if os.path.isdir(path):
-                # Scan folder for images
-                logger.debug(f"Scanning folder: {path}")
-                paths.extend(self._scan_folder(path))
-            elif self._is_image(path):
-                paths.append(path)
+            if path.lower().endswith((".jpg", ".jpeg")) and os.path.isfile(path):
+                self.image_dropped.emit(self.slot_index, path)
+                break
 
-        if paths:
-            logger.info(f"Dropped {len(paths)} images")
-            self.images_dropped.emit(paths[:4])  # Limit to 4
-            if len(paths) > 4:
-                logger.warning(f"Too many images ({len(paths)}), using first 4")
-                QMessageBox.warning(
-                    self, "Too Many Images",
-                    f"Found {len(paths)} images. Only the first 4 will be used."
-                )
 
-    def _scan_folder(self, folder: str) -> List[str]:
-        """Scan folder for JPG/JPEG images, sorted alphabetically."""
+class FacadeGridDropZone(QFrame):
+    """
+    2×2 grid as seen when facing the wall (top = higher on wall).
+    Maps to algorithm indices: BL=0, TL=1, TR=2, BR=3.
+    """
+
+    grid_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
+        self.slot_paths: List[Optional[str]] = [None, None, None, None]
+
+        outer = QVBoxLayout(self)
+        outer.setSpacing(8)
+
+        hint = QLabel("Facing the wall — top row is upper on the facade ↑")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setStyleSheet("color: #555; font-size: 11px;")
+        outer.addWidget(hint)
+
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        # (slot_index, grid_row, grid_col, title)
+        layout_spec = [
+            (1, 0, 0, "左上 TL\n#2"),
+            (2, 0, 1, "右上 TR\n#3"),
+            (0, 1, 0, "左下 BL\n#1"),
+            (3, 1, 1, "右下 BR\n#4"),
+        ]
+        by_slot: Dict[int, FacadeCornerSlot] = {}
+        for slot_idx, row, col, title in layout_spec:
+            cell = FacadeCornerSlot(slot_idx, title, self)
+            cell.image_dropped.connect(self._on_slot_image)
+            by_slot[slot_idx] = cell
+            grid.addWidget(cell, row, col)
+        self._cells = [by_slot[i] for i in range(4)]
+
+        outer.addLayout(grid)
+
+        self.instruction = QLabel(
+            "Drop on each cell, or use Select / Folder (fills BL→TL→TR→BR in order)."
+        )
+        self.instruction.setAlignment(Qt.AlignCenter)
+        self.instruction.setWordWrap(True)
+        self.instruction.setStyleSheet("color: #888; font-size: 11px;")
+        outer.addWidget(self.instruction)
+
+    def _on_slot_image(self, slot: int, path: str) -> None:
+        self.slot_paths[slot] = path
+        self._cells[slot].set_path(path)
+        self._update_instruction()
+        self.grid_changed.emit()
+
+    def _update_instruction(self) -> None:
+        n = sum(1 for p in self.slot_paths if p)
+        if n == 4:
+            self.instruction.setText("All 4 corners set — order matches FacadeTransformer (BL, TL, TR, BR).")
+            self.instruction.setStyleSheet("color: #4caf50; font-size: 11px;")
+        elif n > 0:
+            self.instruction.setText(f"{n}/4 corners set — fill BL, TL, TR, BR as when facing the wall.")
+            self.instruction.setStyleSheet("color: #ff9800; font-size: 11px;")
+        else:
+            self.instruction.setText(
+                "Drop on each cell, or use Select / Folder (fills BL→TL→TR→BR in order)."
+            )
+            self.instruction.setStyleSheet("color: #888; font-size: 11px;")
+
+    def apply_sequential_paths(self, paths: List[str]) -> None:
+        """Assign paths to slots 0..3 in order BL, TL, TR, BR."""
+        for i in range(4):
+            self.slot_paths[i] = paths[i] if i < len(paths) else None
+            self._cells[i].set_path(self.slot_paths[i])
+        self._update_instruction()
+        self.grid_changed.emit()
+
+    def clear(self) -> None:
+        for i in range(4):
+            self.slot_paths[i] = None
+            self._cells[i].set_path(None)
+        self._update_instruction()
+        self.grid_changed.emit()
+
+    @staticmethod
+    def scan_folder_images(folder: str) -> List[str]:
         images = []
         for f in sorted(os.listdir(folder)):
-            if self._is_image(f):
+            if f.lower().endswith((".jpg", ".jpeg")):
                 images.append(os.path.join(folder, f))
         return images
-
-    def _is_image(self, path: str) -> bool:
-        return path.lower().endswith(('.jpg', '.jpeg'))
-
-    def update_thumbnails(self, paths: List[str]):
-        """Update thumbnail display with loaded images."""
-        for i, thumb in enumerate(self.thumb_labels):
-            if i < len(paths):
-                pixmap = QPixmap(paths[i])
-                if not pixmap.isNull():
-                    scaled = pixmap.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    thumb.setPixmap(scaled)
-                else:
-                    thumb.setText("ERR")
-                self.name_labels[i].setText(Path(paths[i]).name[:12])
-            else:
-                thumb.clear()
-                thumb.setText(f"{i+1}")
-                self.name_labels[i].setText("Empty")
-
-        if len(paths) == 4:
-            self.instruction.setText("4 images loaded")
-            self.instruction.setStyleSheet("color: #4caf50; font-size: 12px;")
-        elif len(paths) > 0:
-            self.instruction.setText(f"{len(paths)}/4 images loaded")
-            self.instruction.setStyleSheet("color: #ff9800; font-size: 12px;")
-        else:
-            self.instruction.setText("Drop images or folder here")
-            self.instruction.setStyleSheet("color: #888; font-size: 12px;")
-
-    def clear(self):
-        """Clear all thumbnails."""
-        self.update_thumbnails([])
 
 
 # =============================================================================
@@ -190,7 +225,7 @@ class MainWindow(QMainWindow):
 
         # State
         self.image_paths: List[str] = []
-        self.gps_data: List[Tuple[float, float, float]] = []
+        self.gps_data: List[Optional[Tuple[float, float, float]]] = []
         self.generated_waypoints: List[Tuple[float, float, float]] = []
         self.transformer: Optional[core.FacadeTransformer] = None
         self.flight_direction: str = ""
@@ -227,9 +262,9 @@ class MainWindow(QMainWindow):
         group = QGroupBox("1. Input Settings")
         layout = QVBoxLayout(group)
 
-        # Drop zone
-        self.drop_zone = DropZone()
-        self.drop_zone.images_dropped.connect(self._on_images_dropped)
+        # 2×2 corner grid (facing wall → BL, TL, TR, BR)
+        self.drop_zone = FacadeGridDropZone()
+        self.drop_zone.grid_changed.connect(self._on_facade_grid_changed)
         layout.addWidget(self.drop_zone)
 
         # Buttons row
@@ -328,7 +363,9 @@ class MainWindow(QMainWindow):
 
         self.chk_force_vertical = QCheckBox("Force Vertical Plane")
         self.chk_force_vertical.setChecked(True)
-        self.chk_force_vertical.setToolTip("Ensure flight path is on a true vertical plane regardless of camera position tilt")
+        self.chk_force_vertical.setToolTip(
+            "Ensure flight path is on a true vertical plane regardless of camera tilt"
+        )
         self.chk_force_vertical.stateChanged.connect(self._on_param_changed)
         layout.addWidget(self.chk_force_vertical, 4, 0, 1, 4)
 
@@ -371,7 +408,7 @@ class MainWindow(QMainWindow):
         self.spin_height_offset.setRange(-100.0, 100.0)
         self.spin_height_offset.setValue(0.0)
         self.spin_height_offset.setDecimals(1)
-        self.spin_height_offset.setToolTip("Add constant offset to all waypoint altitudes (positive = higher)")
+        self.spin_height_offset.setToolTip("Constant offset added to all waypoint altitudes (+ = higher)")
         self.spin_height_offset.valueChanged.connect(self._on_param_changed)
         layout.addWidget(self.spin_height_offset, 2, 1)
 
@@ -387,7 +424,9 @@ class MainWindow(QMainWindow):
         self.txt_info = QTextEdit()
         self.txt_info.setReadOnly(True)
         self.txt_info.setMaximumHeight(120)
-        self.txt_info.setPlaceholderText("Load 4 images to see GPS metadata...")
+        self.txt_info.setPlaceholderText(
+            "在田字格中放满四张角点照片（左下→左上→右上→右下，面对墙）后显示 GPS…"
+        )
         layout.addWidget(self.txt_info)
 
         return group
@@ -404,6 +443,12 @@ class MainWindow(QMainWindow):
         self.btn_generate.setStyleSheet("font-weight: bold;")
         self.btn_generate.clicked.connect(self._generate_mission)
         layout.addWidget(self.btn_generate)
+
+        self.lbl_raw_order_warning = QLabel("")
+        self.lbl_raw_order_warning.setWordWrap(True)
+        self.lbl_raw_order_warning.setStyleSheet("color: #f44336; font-weight: bold;")
+        self.lbl_raw_order_warning.setVisible(False)
+        layout.addWidget(self.lbl_raw_order_warning)
 
         self.lbl_gen_status = QLabel("Status: Waiting for images...")
         self.lbl_gen_status.setWordWrap(True)
@@ -454,11 +499,13 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------------------
     # Event Handlers
     # -------------------------------------------------------------------------
-    def _on_images_dropped(self, paths: List[str]):
-        """Handle images dropped or selected."""
-        logger.info(f"Loading {len(paths[:4])} images")
-        self.image_paths = paths[:4]
-        self.drop_zone.update_thumbnails(self.image_paths)
+    def _on_facade_grid_changed(self):
+        """Sync image_paths from 2×2 corner slots (BL, TL, TR, BR)."""
+        if all(self.drop_zone.slot_paths):
+            self.image_paths = [p for p in self.drop_zone.slot_paths if p]
+            logger.info("All 4 facade corners assigned (BL→TL→TR→BR order)")
+        else:
+            self.image_paths = []
         self._extract_gps()
         self._invalidate_generation()
         self._update_ui_state()
@@ -466,11 +513,21 @@ class MainWindow(QMainWindow):
     def _select_images(self):
         """Open file dialog to select images."""
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Select Images", "",
-            "Images (*.jpg *.jpeg *.JPG *.JPEG)"
+            self,
+            "Select 4 images in order: BL → TL → TR → BR (facing wall)",
+            "",
+            "Images (*.jpg *.jpeg *.JPG *.JPEG)",
         )
         if files:
-            self._on_images_dropped(files)
+            if len(files) != 4:
+                QMessageBox.warning(
+                    self,
+                    "Need 4 images",
+                    "Select exactly 4 images in corner order: "
+                    "左下(BL), 左上(TL), 右上(TR), 右下(BR).",
+                )
+                return
+            self.drop_zone.apply_sequential_paths(files)
 
     def _select_folder(self):
         """Open folder dialog to select image folder."""
@@ -488,15 +545,18 @@ class MainWindow(QMainWindow):
             if len(images) < 4:
                 QMessageBox.warning(
                     self, "Not Enough Images",
-                    f"Found only {len(images)} images. Need 4 for facade detection."
+                    f"Found only {len(images)} images. Need 4 for facade detection.",
                 )
-            elif len(images) > 4:
+                return
+            if len(images) > 4:
                 QMessageBox.information(
                     self, "Multiple Images",
-                    f"Found {len(images)} images. Using first 4 (alphabetically sorted)."
+                    f"Found {len(images)} images. Using first 4 alphabetically — "
+                    "verify they match BL, TL, TR, BR or assign per cell.",
                 )
+                images = images[:4]
 
-            self._on_images_dropped(images)
+            self.drop_zone.apply_sequential_paths(images)
 
     def _clear_images(self):
         """Clear all loaded images."""
@@ -506,6 +566,9 @@ class MainWindow(QMainWindow):
         self.corner_geometry_ok = False
         self.drop_zone.clear()
         self.txt_info.clear()
+        if hasattr(self, "lbl_raw_order_warning"):
+            self.lbl_raw_order_warning.clear()
+            self.lbl_raw_order_warning.setVisible(False)
         self._invalidate_generation()
         self._update_ui_state()
 
@@ -527,25 +590,37 @@ class MainWindow(QMainWindow):
         self.spin_vfov.setEnabled(False)
 
     def _extract_gps(self):
-        """Extract GPS from loaded images."""
+        """Extract GPS per facade corner slot (BL, TL, TR, BR — facing wall)."""
         logger.debug("Extracting GPS data from images")
         self.gps_data = []
         self.corner_geometry_ok = False
         info_lines = []
 
-        for i, path in enumerate(self.image_paths):
+        corner_labels = ("左下 BL", "左上 TL", "右上 TR", "右下 BR")
+        slot_paths = self.drop_zone.slot_paths
+
+        # Reset raw-order warning (will be set again if geometry check passes)
+        if hasattr(self, "lbl_raw_order_warning"):
+            self.lbl_raw_order_warning.clear()
+            self.lbl_raw_order_warning.setVisible(False)
+
+        for i, path in enumerate(slot_paths):
+            label = corner_labels[i]
+            if not path:
+                info_lines.append(f"{label}: (未放置照片)")
+                self.gps_data.append(None)
+                continue
             try:
                 lat, lon, alt = core.read_gps(path)
                 self.gps_data.append((lat, lon, alt))
-
                 lat_dir = "N" if lat >= 0 else "S"
                 lon_dir = "E" if lon >= 0 else "W"
                 info_lines.append(
-                    f"Photo {i+1}: {abs(lat):.6f}°{lat_dir}, {abs(lon):.6f}°{lon_dir}, {alt:.1f}m (WGS84)"
+                    f"{label}: {abs(lat):.6f}°{lat_dir}, {abs(lon):.6f}°{lon_dir}, {alt:.1f}m (WGS84)"
                 )
             except Exception as e:
-                logger.error(f"Failed to extract GPS from photo {i+1}: {e}")
-                info_lines.append(f"Photo {i+1}: ERROR - {str(e)}")
+                logger.error(f"Failed to extract GPS for {label}: {e}")
+                info_lines.append(f"{label}: ERROR — {e}")
                 self.gps_data.append(None)
 
         # Facade geometry + near-rectangle corners (blocks Generate if invalid)
@@ -554,18 +629,22 @@ class MainWindow(QMainWindow):
                 tf = core.FacadeTransformer(self.gps_data)
                 core.validate_facade_corner_geometry(tf)
                 self.corner_geometry_ok = True
+
+                raw_warn = getattr(tf, "raw_order_warning", None)
+                if raw_warn and hasattr(self, "lbl_raw_order_warning"):
+                    self.lbl_raw_order_warning.setText(
+                        "Warning: The uploaded corner order may not match the recommended order, "
+                        "which could affect facade interpretation and planning accuracy. "
+                        "The system has continued using automatic geometric corner identification. "
+                        "Please review the selected corners."
+                    )
+                    self.lbl_raw_order_warning.setVisible(True)
                 xs = [p[0] for p in tf.facade_pts]
                 zs = [p[2] for p in tf.facade_pts]
                 width = max(xs) - min(xs)
                 height = max(zs) - min(zs)
                 info_lines.append(f"\nFacade: {width:.1f}m × {height:.1f}m")
-                logger.info(f"Facade detected: {width:.1f}m × {height:.1f}m")
-            except ValueError as e:
-                self.corner_geometry_ok = False
-                logger.warning(f"Geometry check failed: {e}")
-                info_lines.append(f"\nGeometry check failed: {e}")
             except Exception as e:
-                self.corner_geometry_ok = False
                 logger.error(f"Facade analysis error: {e}")
                 info_lines.append(f"\nFacade analysis error: {str(e)}")
 
@@ -612,12 +691,6 @@ class MainWindow(QMainWindow):
             core.GIMBAL_PITCH_DEG = self.spin_gimbal.value()
             core.EXECUTE_HEIGHT_MODE = self.combo_exec_height.currentText()
             core.TEMPLATE_HEIGHT_MODE = self.combo_template_height.currentText()
-            core.DRONE_TYPE = self.combo_drone.currentText()
-            prof = core.DRONE_WPML_PROFILES[core.DRONE_TYPE]
-            core.WPML_DRONE_ENUM = str(prof["drone"])
-            core.WPML_DRONE_SUB_ENUM = str(prof["drone_sub"])
-            core.WPML_PAYLOAD_ENUM = str(prof["payload"])
-            core.WPML_PAYLOAD_SUB_ENUM = str(prof["payload_sub"])
             core.HEIGHT_OFFSET = self.spin_height_offset.value()
 
             # Generate
@@ -689,8 +762,11 @@ class MainWindow(QMainWindow):
 
     def _update_ui_state(self):
         """Update UI enabled/disabled states."""
+        slots_ok = all(self.drop_zone.slot_paths)
         has_4_images = (
-            len(self.image_paths) == 4
+            slots_ok
+            and len(self.image_paths) == 4
+            and len(self.gps_data) == 4
             and all(g is not None for g in self.gps_data)
             and self.corner_geometry_ok
         )
@@ -702,7 +778,12 @@ class MainWindow(QMainWindow):
         self.btn_save_both.setEnabled(has_generation)
 
         if not has_4_images:
-            if len(self.image_paths) == 4 and all(g is not None for g in self.gps_data) and not self.corner_geometry_ok:
+            if (
+                slots_ok
+                and len(self.gps_data) == 4
+                and all(g is not None for g in self.gps_data)
+                and not self.corner_geometry_ok
+            ):
                 self.lbl_gen_status.setText("Status: Corner geometry check failed — see panel below.")
             else:
                 self.lbl_gen_status.setText("Status: Load 4 valid images to enable generation")
