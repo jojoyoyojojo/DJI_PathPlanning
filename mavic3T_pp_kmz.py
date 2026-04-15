@@ -972,17 +972,6 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
     
     SubElement(folder, "wpml:caliFlightEnable").text = "0"
     SubElement(folder, "wpml:gimbalPitchMode").text = "manual"
-    
-    # Global waypoint heading param — fixed at facade-facing yaw for sideways flight
-    ghparam = SubElement(folder, "wpml:globalWaypointHeadingParam")
-    SubElement(ghparam, "wpml:waypointHeadingMode").text = WAYPOINT_HEADING_MODE
-    SubElement(ghparam, "wpml:waypointHeadingAngle").text = f"{head_deg:.1f}"
-    SubElement(ghparam, "wpml:waypointPoiPoint").text = "0.000000,0.000000,0.000000"
-    SubElement(ghparam, "wpml:waypointHeadingPathMode").text = "followBadArc"
-    SubElement(ghparam, "wpml:waypointHeadingPoiIndex").text = "0"
-    
-    SubElement(folder, "wpml:globalWaypointTurnMode").text = "toPointAndStopWithDiscontinuityCurvature"
-    SubElement(folder, "wpml:globalUseStraightLine").text = "1"
 
     # Heading facing wall: Y' points toward facade, so drone faces in Y' direction
     R = tf.R; yprime_enu = np.array(R[1], dtype=float)
@@ -994,6 +983,17 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
         ang = degrees(atan2(dy,dx))
         return (ang+360.0)%360.0
     head_deg = yaw_from_xy(to_wall)
+    
+    # Global waypoint heading param — fixed at facade-facing yaw for sideways flight
+    ghparam = SubElement(folder, "wpml:globalWaypointHeadingParam")
+    SubElement(ghparam, "wpml:waypointHeadingMode").text = WAYPOINT_HEADING_MODE
+    SubElement(ghparam, "wpml:waypointHeadingAngle").text = f"{head_deg:.1f}"
+    SubElement(ghparam, "wpml:waypointPoiPoint").text = "0.000000,0.000000,0.000000"
+    SubElement(ghparam, "wpml:waypointHeadingPathMode").text = "followBadArc"
+    SubElement(ghparam, "wpml:waypointHeadingPoiIndex").text = "0"
+    
+    SubElement(folder, "wpml:globalWaypointTurnMode").text = "toPointAndStopWithDiscontinuityCurvature"
+    SubElement(folder, "wpml:globalUseStraightLine").text = "1"
 
     # Waypoints
     for i,(lat,lon,alt_wgs84) in enumerate(wps):
