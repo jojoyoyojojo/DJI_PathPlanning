@@ -98,6 +98,7 @@ def apply_drone_wpml_profile(drone_key: str) -> None:
 
 
 GIMBAL_PITCH_DEG = 0.0     # level shot at each point
+ENABLE_PHOTO_CAPTURE = True  # Take a photo at each waypoint pause
 # Waypoint heading: fixed = keep yaw between legs (lateral snake without nose-along-path yaw)
 WAYPOINT_HEADING_MODE = "fixed"
 HEIGHT_OFFSET = 0.0        # Constant offset added to all waypoint altitudes (meters)
@@ -889,7 +890,17 @@ def build_waylines_wpml(tf: FacadeTransformer, wps: List[Tuple[float,float,float
         SubElement(aparam2, "wpml:gimbalRotateTimeEnable").text = "0"
         SubElement(aparam2, "wpml:gimbalRotateTime").text = "0"
         SubElement(aparam2, "wpml:payloadPositionIndex").text = "0"
-        
+
+        if ENABLE_PHOTO_CAPTURE:
+            act3 = SubElement(agroup, "wpml:action")
+            SubElement(act3, "wpml:actionId").text = "2"
+            SubElement(act3, "wpml:actionActuatorFunc").text = "takePhoto"
+            aparam3 = SubElement(act3, "wpml:actionActuatorFuncParam")
+            SubElement(aparam3, "wpml:payloadPositionIndex").text = "0"
+            SubElement(aparam3, "wpml:fileSuffix").text = "point"
+            SubElement(aparam3, "wpml:payloadLensIndex").text = "wide"
+            SubElement(aparam3, "wpml:useGlobalPayloadLensIndex").text = "0"
+
         # Gimbal heading param
         ghparam = SubElement(pm, "wpml:waypointGimbalHeadingParam")
         SubElement(ghparam, "wpml:waypointGimbalPitchAngle").text = "0"
@@ -1064,7 +1075,17 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
         SubElement(aparam2, "wpml:gimbalRotateTimeEnable").text = "0"
         SubElement(aparam2, "wpml:gimbalRotateTime").text = "0"
         SubElement(aparam2, "wpml:payloadPositionIndex").text = "0"
-        
+
+        if ENABLE_PHOTO_CAPTURE:
+            act3 = SubElement(agroup, "wpml:action")
+            SubElement(act3, "wpml:actionId").text = "2"
+            SubElement(act3, "wpml:actionActuatorFunc").text = "takePhoto"
+            aparam3 = SubElement(act3, "wpml:actionActuatorFuncParam")
+            SubElement(aparam3, "wpml:payloadPositionIndex").text = "0"
+            SubElement(aparam3, "wpml:fileSuffix").text = "point"
+            SubElement(aparam3, "wpml:payloadLensIndex").text = "wide"
+            SubElement(aparam3, "wpml:useGlobalPayloadLensIndex").text = "0"
+
         SubElement(pm, "wpml:isRisky").text = "0"
     
     # Payload param at folder level

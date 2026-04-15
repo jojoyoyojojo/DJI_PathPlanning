@@ -412,6 +412,14 @@ class MainWindow(QMainWindow):
         self.spin_height_offset.valueChanged.connect(self._on_param_changed)
         layout.addWidget(self.spin_height_offset, 2, 1)
 
+        self.chk_photo_capture = QCheckBox("Take Photo at Each Waypoint")
+        self.chk_photo_capture.setChecked(True)
+        self.chk_photo_capture.setToolTip(
+            "Add a takePhoto action at each waypoint after the drone pauses and adjusts gimbal"
+        )
+        self.chk_photo_capture.stateChanged.connect(self._on_param_changed)
+        layout.addWidget(self.chk_photo_capture, 3, 0, 1, 4)
+
         return group
 
     # -------------------------------------------------------------------------
@@ -692,6 +700,7 @@ class MainWindow(QMainWindow):
             core.EXECUTE_HEIGHT_MODE = self.combo_exec_height.currentText()
             core.TEMPLATE_HEIGHT_MODE = self.combo_template_height.currentText()
             core.HEIGHT_OFFSET = self.spin_height_offset.value()
+            core.ENABLE_PHOTO_CAPTURE = self.chk_photo_capture.isChecked()
 
             # Generate
             self.transformer, self.flight_direction, self.generated_waypoints = \
