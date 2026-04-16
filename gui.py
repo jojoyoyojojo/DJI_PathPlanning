@@ -146,10 +146,10 @@ class FacadeGridDropZone(QFrame):
         grid.setSpacing(10)
         # (slot_index, grid_row, grid_col, title)
         layout_spec = [
-            (1, 0, 0, "左上 TL\n#2"),
-            (2, 0, 1, "右上 TR\n#3"),
-            (0, 1, 0, "左下 BL\n#1"),
-            (3, 1, 1, "右下 BR\n#4"),
+            (1, 0, 0, "Top-Left TL\n#2"),
+            (2, 0, 1, "Top-Right TR\n#3"),
+            (0, 1, 0, "Bottom-Left BL\n#1"),
+            (3, 1, 1, "Bottom-Right BR\n#4"),
         ]
         by_slot: Dict[int, FacadeCornerSlot] = {}
         for slot_idx, row, col, title in layout_spec:
@@ -393,32 +393,13 @@ class MainWindow(QMainWindow):
         self.spin_gimbal.setDecimals(1)
         layout.addWidget(self.spin_gimbal, 0, 3)
 
-        layout.addWidget(QLabel("Execute Height:"), 1, 0)
-        self.combo_exec_height = QComboBox()
-        self.combo_exec_height.addItems(["WGS84", "relativeToStartPoint"])
-        layout.addWidget(self.combo_exec_height, 1, 1)
-
-        layout.addWidget(QLabel("Template Height:"), 1, 2)
-        self.combo_template_height = QComboBox()
-        self.combo_template_height.addItems(["EGM96", "relativeToStartPoint"])
-        layout.addWidget(self.combo_template_height, 1, 3)
-
-        layout.addWidget(QLabel("Height Offset (m):"), 2, 0)
-        self.spin_height_offset = QDoubleSpinBox()
-        self.spin_height_offset.setRange(-100.0, 100.0)
-        self.spin_height_offset.setValue(0.0)
-        self.spin_height_offset.setDecimals(1)
-        self.spin_height_offset.setToolTip("Constant offset added to all waypoint altitudes (+ = higher)")
-        self.spin_height_offset.valueChanged.connect(self._on_param_changed)
-        layout.addWidget(self.spin_height_offset, 2, 1)
-
         self.chk_photo_capture = QCheckBox("Take Photo at Each Waypoint")
         self.chk_photo_capture.setChecked(True)
         self.chk_photo_capture.setToolTip(
             "Add a takePhoto action at each waypoint after the drone pauses and adjusts gimbal"
         )
         self.chk_photo_capture.stateChanged.connect(self._on_param_changed)
-        layout.addWidget(self.chk_photo_capture, 3, 0, 1, 4)
+        layout.addWidget(self.chk_photo_capture, 1, 0, 1, 4)
 
         return group
 
@@ -433,7 +414,7 @@ class MainWindow(QMainWindow):
         self.txt_info.setReadOnly(True)
         self.txt_info.setMaximumHeight(120)
         self.txt_info.setPlaceholderText(
-            "在田字格中放满四张角点照片（左下→左上→右上→右下，面对墙）后显示 GPS…"
+            "Drop 4 corner photos (BL → TL → TR → BR, facing the wall) to display GPS…"
         )
         layout.addWidget(self.txt_info)
 
@@ -532,7 +513,7 @@ class MainWindow(QMainWindow):
                     self,
                     "Need 4 images",
                     "Select exactly 4 images in corner order: "
-                    "左下(BL), 左上(TL), 右上(TR), 右下(BR).",
+                    "Bottom-Left (BL), Top-Left (TL), Top-Right (TR), Bottom-Right (BR).",
                 )
                 return
             self.drop_zone.apply_sequential_paths(files)
@@ -604,7 +585,7 @@ class MainWindow(QMainWindow):
         self.corner_geometry_ok = False
         info_lines = []
 
-        corner_labels = ("左下 BL", "左上 TL", "右上 TR", "右下 BR")
+        corner_labels = ("Bottom-Left BL", "Top-Left TL", "Top-Right TR", "Bottom-Right BR")
         slot_paths = self.drop_zone.slot_paths
 
         # Reset raw-order warning (will be set again if geometry check passes)
@@ -615,7 +596,7 @@ class MainWindow(QMainWindow):
         for i, path in enumerate(slot_paths):
             label = corner_labels[i]
             if not path:
-                info_lines.append(f"{label}: (未放置照片)")
+                info_lines.append(f"{label}: (no photo assigned)")
                 self.gps_data.append(None)
                 continue
             try:
@@ -685,7 +666,6 @@ class MainWindow(QMainWindow):
             logger.debug(f"Parameters: photo_dist={self.spin_photo_dist.value()}, flight_dist={self.spin_flight_dist.value()}")
             logger.debug(f"Parameters: HFOV={self.spin_hfov.value()}, VFOV={self.spin_vfov.value()}, overlap={self.spin_overlap.value()}")
             logger.debug(f"Parameters: force_vertical={self.chk_force_vertical.isChecked()}, smart_planning={self.chk_smart_planning.isChecked()}")
-            logger.debug(f"Parameters: height_offset={self.spin_height_offset.value()}")
             core.PHOTO_DISTANCE = self.spin_photo_dist.value()
             core.FLIGHT_DISTANCE = self.spin_flight_dist.value()
             core.CAMERA_HFOV = self.spin_hfov.value()
@@ -697,9 +677,6 @@ class MainWindow(QMainWindow):
             core.FORCE_VERTICAL_PLANE = self.chk_force_vertical.isChecked()
             core.AUTO_FLIGHT_SPEED = self.spin_speed.value()
             core.GIMBAL_PITCH_DEG = self.spin_gimbal.value()
-            core.EXECUTE_HEIGHT_MODE = self.combo_exec_height.currentText()
-            core.TEMPLATE_HEIGHT_MODE = self.combo_template_height.currentText()
-            core.HEIGHT_OFFSET = self.spin_height_offset.value()
             core.ENABLE_PHOTO_CAPTURE = self.chk_photo_capture.isChecked()
 
             # Generate
