@@ -268,29 +268,31 @@ class FacadeTransformer:
         self, xprime: List[float], yprime: List[float], zprime: List[float]
     ) -> Tuple[List[float], List[float], List[float]]:
         """
-        Using corner order BL(0)→TL(1)→TR(2) as CCW on the wall from outside:
-        u×v points outward (toward camera). +Y' must be toward building (−horizontal part when vertical).
+        Camera positions BL(0)→TL(1)→TR(2) viewed from outside the wall form a
+        CCW loop, but the right-hand cross product (BL→TL)×(TL→TR) points
+        *through* the camera plane away from the observer — i.e. toward the
+        building.  We use this directly as the target direction for +Y'.
         """
         u = [self.enu[1][i] - self.enu[0][i] for i in range(3)]
         v = [self.enu[2][i] - self.enu[1][i] for i in range(3)]
-        n_out = self._cross(u, v)
-        ln = sqrt(sum(x * x for x in n_out))
+        n_toward = self._cross(u, v)
+        ln = sqrt(sum(x * x for x in n_toward))
         if ln < 1e-9:
             logger.warning(
                 "Degenerate edge cross (BL→TL)×(TL→TR); cannot verify Y' sign from corner order"
             )
             return xprime, yprime, zprime
-        n_out = [x / ln for x in n_out]
+        n_toward = [x / ln for x in n_toward]
 
         if FORCE_VERTICAL_PLANE:
-            y_toward_b = [-n_out[0], -n_out[1], 0.0]
+            y_toward_b = [n_toward[0], n_toward[1], 0.0]
             lh = sqrt(y_toward_b[0] ** 2 + y_toward_b[1] ** 2)
             if lh < 1e-9:
-                logger.warning("Wall outward normal has no horizontal part; skip Y' alignment")
+                logger.warning("Cross-product normal has no horizontal part; skip Y' alignment")
                 return xprime, yprime, zprime
             y_toward_b = [y_toward_b[0] / lh, y_toward_b[1] / lh, 0.0]
         else:
-            y_toward_b = [-n_out[0], -n_out[1], -n_out[2]]
+            y_toward_b = [n_toward[0], n_toward[1], n_toward[2]]
             lb = sqrt(sum(x * x for x in y_toward_b))
             if lb < 1e-9:
                 return xprime, yprime, zprime
@@ -810,9 +812,9 @@ def build_waylines_wpml(tf: FacadeTransformer, wps: List[Tuple[float,float,float
     nrm = np.linalg.norm(to_wall[:2]) + 1e-12
     to_wall[:2] /= nrm
     def yaw_from_xy(vxy):
-        dx,dy=float(vxy[0]),float(vxy[1])
-        ang = degrees(atan2(dy,dx))
-        return (ang+360.0)%360.0
+        east, north = float(vxy[0]), float(vxy[1])
+        bearing = degrees(atan2(east, north))
+        return (bearing + 360.0) % 360.0
     head_deg = yaw_from_xy(to_wall)
 
     lat0,lon0,alt0 = tf.ref
@@ -979,9 +981,9 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
     nrm = np.linalg.norm(to_wall[:2]) + 1e-12
     to_wall[:2] /= nrm
     def yaw_from_xy(vxy):
-        dx,dy=float(vxy[0]),float(vxy[1])
-        ang = degrees(atan2(dy,dx))
-        return (ang+360.0)%360.0
+        east, north = float(vxy[0]), float(vxy[1])
+        bearing = degrees(atan2(east, north))
+        return (bearing + 360.0) % 360.0
     head_deg = yaw_from_xy(to_wall)
     
     # Global waypoint heading param — fixed at facade-facing yaw for sideways flight
