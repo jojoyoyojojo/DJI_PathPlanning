@@ -325,7 +325,7 @@ class FacadeTransformer:
                 )
             yprime = [yprime_raw[0]/horiz_len, yprime_raw[1]/horiz_len, 0.0]
             zprime = [0.0, 0.0, 1.0]
-            xprime = self._cross(zprime, yprime)
+            xprime = self._cross(yprime, zprime)
             logger.debug(f"Vertical plane - Y': [{yprime[0]:.4f}, {yprime[1]:.4f}, {yprime[2]:.4f}], Z': [0, 0, 1]")
         else:
             logger.info("Using original tilted plane fitting")
