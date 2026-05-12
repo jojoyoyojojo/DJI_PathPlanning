@@ -66,8 +66,7 @@ python3 height_converter.py <image.jpg>
 在 `mavic3T_pp_kmz.py` 中编辑参数：
 
 ```python
-PHOTO_DISTANCE = 5.0    # 拍照时相机到外立面的距离 (米)
-FLIGHT_DISTANCE = 5.0   # 期望的飞行距离 (米)
+PHOTO_DISTANCE = 5.0    # 统一飞行距离：预飞拍照与正式飞行都使用该距离 (米)
 CAMERA_HFOV = 84.0      # 水平视场角 (度)
 CAMERA_VFOV = 62.0      # 垂直视场角 (度)
 OVERLAP_RATE = 0.65     # 照片重叠率 (0-1)
@@ -94,12 +93,13 @@ GPS (EXIF 中的 WGS84)
 
 ### RTK 四点检测原理
 
-相机位置定义了一个与实际外立面平行的平面：
+相机位置定义了一个与实际外立面平行的平面，正式任务沿相同采样平面飞行：
 
 ```
-相机平面 (RTK GPS)         外立面平面           飞行平面
-        |                      |                      |
-        |<-- PHOTO_DISTANCE -->|<-- FLIGHT_DISTANCE ->|
+相机平面 (RTK GPS)         外立面平面
+        |                      |
+        |<-- PHOTO_DISTANCE -->|
+        ^ 任务飞行沿该采样平面执行
 ```
 
 ## 技术参考

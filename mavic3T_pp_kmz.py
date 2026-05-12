@@ -42,16 +42,13 @@ PHOTO_PATHS = [
     '/Users/andyliu/Downloads/hkstp_test/11/DJI_0112.JPG',
 ]
 
-# Planning（与 GUI / 校验一致：拍照距离与飞行距离 3–20 m）
+# Planning（与 GUI / 校验一致：统一距离 3–20 m）
 PHOTO_DISTANCE_MIN = 3.0
 PHOTO_DISTANCE_MAX = 20.0
-FLIGHT_DISTANCE_MIN = 3.0
-FLIGHT_DISTANCE_MAX = 20.0
 AUTO_FLIGHT_SPEED_MIN = 0.1
 AUTO_FLIGHT_SPEED_MAX = 10.0
 
 PHOTO_DISTANCE = 5.0      # Distance from camera to facade when corner photos were taken (meters) - RTK prior knowledge
-FLIGHT_DISTANCE = 5.0     # Desired distance from facade for mission flight (meters)
 OVERLAP_RATE = 0.65       # 0–1，对应 0%–100% 重叠
 ENABLE_SMART_PLANNING = True
 FORCE_VERTICAL_PLANE = True  # Force flight plane to be vertical regardless of camera position tilt
@@ -368,10 +365,6 @@ def validate_planning_params() -> None:
     if not (PHOTO_DISTANCE_MIN <= PHOTO_DISTANCE <= PHOTO_DISTANCE_MAX):
         raise ValueError(
             f"Photo distance must be between {PHOTO_DISTANCE_MIN:.0f} and {PHOTO_DISTANCE_MAX:.0f} m (got {PHOTO_DISTANCE} m)."
-        )
-    if not (FLIGHT_DISTANCE_MIN <= FLIGHT_DISTANCE <= FLIGHT_DISTANCE_MAX):
-        raise ValueError(
-            f"Flight distance must be between {FLIGHT_DISTANCE_MIN:.0f} and {FLIGHT_DISTANCE_MAX:.0f} m (got {FLIGHT_DISTANCE} m)."
         )
     if not (AUTO_FLIGHT_SPEED_MIN <= AUTO_FLIGHT_SPEED <= AUTO_FLIGHT_SPEED_MAX):
         raise ValueError(
@@ -697,7 +690,7 @@ def build_waypoints_from_images(images: List[str]):
         direction = "horizontal"
         logger.debug("Smart planning disabled, using horizontal direction")
 
-    step_cross, step_along = plan_steps(direction, FLIGHT_DISTANCE, OVERLAP_RATE)
+    step_cross, step_along = plan_steps(direction, PHOTO_DISTANCE, OVERLAP_RATE)
     cross_span = w if direction=="vertical" else h
     num_lines = int(max(1, round(cross_span/step_cross))) + 1
     logger.debug(f"Step cross={step_cross:.2f}m, step along={step_along:.2f}m, num_lines={num_lines}")
@@ -707,10 +700,9 @@ def build_waypoints_from_images(images: List[str]):
     avg_y = sum(yps)/len(yps)
     # Origin = centroid of the four cameras → sum(facade_pts)==0 ⇒ avg_y ≈ 0.
     # +Y' = toward building (enforced from BL→TL→TR CCW order in FacadeTransformer).
-    # Wall ≈ +PHOTO_DISTANCE along Y' from camera plane; flight line F m in front of wall:
-    # safe_y ≈ PHOTO_DISTANCE - FLIGHT_DISTANCE.
-    safe_y = avg_y + PHOTO_DISTANCE - FLIGHT_DISTANCE
-    logger.info(f"RTK offset: camera Y'={avg_y:.2f}m, photo_dist={PHOTO_DISTANCE}m, flight_dist={FLIGHT_DISTANCE}m → flight Y'={safe_y:.2f}m")
+    # Flight reuses the same stand-off as corner photos, so mission flies on camera sampling plane.
+    safe_y = avg_y
+    logger.info(f"RTK offset: camera Y'={avg_y:.2f}m, photo_dist={PHOTO_DISTANCE}m (shared for planning/flight) → flight Y'={safe_y:.2f}m")
 
     wps=[]
     if direction=="vertical":

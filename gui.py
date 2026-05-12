@@ -439,23 +439,14 @@ class MainWindow(QMainWindow):
         self.edit_mission_name = QLineEdit("Facade Mission")
         params.addWidget(self.edit_mission_name, 0, 1, 1, 3)
 
-        params.addWidget(QLabel("Photo Distance (m):"), 1, 0)
+        params.addWidget(QLabel("Distance (m):"), 1, 0)
         self.spin_photo_dist = QDoubleSpinBox()
         self.spin_photo_dist.setRange(core.PHOTO_DISTANCE_MIN, core.PHOTO_DISTANCE_MAX)
         self.spin_photo_dist.setValue(5.0)
         self.spin_photo_dist.setDecimals(1)
         self.spin_photo_dist.setToolTip(f"{core.PHOTO_DISTANCE_MIN:.0f}–{core.PHOTO_DISTANCE_MAX:.0f} m")
         self.spin_photo_dist.valueChanged.connect(self._on_param_changed)
-        params.addWidget(self.spin_photo_dist, 1, 1)
-
-        params.addWidget(QLabel("Flight Distance (m):"), 1, 2)
-        self.spin_flight_dist = QDoubleSpinBox()
-        self.spin_flight_dist.setRange(core.FLIGHT_DISTANCE_MIN, core.FLIGHT_DISTANCE_MAX)
-        self.spin_flight_dist.setValue(5.0)
-        self.spin_flight_dist.setDecimals(1)
-        self.spin_flight_dist.setToolTip(f"{core.FLIGHT_DISTANCE_MIN:.0f}–{core.FLIGHT_DISTANCE_MAX:.0f} m")
-        self.spin_flight_dist.valueChanged.connect(self._on_param_changed)
-        params.addWidget(self.spin_flight_dist, 1, 3)
+        params.addWidget(self.spin_photo_dist, 1, 1, 1, 3)
 
         layout.addLayout(params)
 
@@ -811,11 +802,10 @@ class MainWindow(QMainWindow):
 
         try:
             # Update core module parameters
-            logger.debug(f"Parameters: photo_dist={self.spin_photo_dist.value()}, flight_dist={self.spin_flight_dist.value()}")
+            logger.debug(f"Parameters: distance={self.spin_photo_dist.value()}")
             logger.debug(f"Parameters: HFOV={self.spin_hfov.value()}, VFOV={self.spin_vfov.value()}, overlap={self.spin_overlap.value()}")
             logger.debug(f"Parameters: force_vertical={self.chk_force_vertical.isChecked()}, smart_planning={self.chk_smart_planning.isChecked()}")
             core.PHOTO_DISTANCE = self.spin_photo_dist.value()
-            core.FLIGHT_DISTANCE = self.spin_flight_dist.value()
             core.CAMERA_HFOV = self.spin_hfov.value()
             core.CAMERA_VFOV = self.spin_vfov.value()
             core.HFOV_RAD = core.radians(core.CAMERA_HFOV)
