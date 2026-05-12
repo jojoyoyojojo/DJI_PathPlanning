@@ -12,6 +12,7 @@ Provides a desktop interface for the drone mission planning tool with:
 
 import sys
 import os
+import struct
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -27,6 +28,153 @@ from loguru import logger
 
 # Import core algorithm functions
 import mavic3T_pp_kmz as core
+
+
+# =============================================================================
+# DNG preview extraction (minimal TIFF parser, pure-Python)
+# =============================================================================
+# Qt's TIFF plugin on many builds cannot decode JPEG-compressed strips inside
+# DNG (errors like "JPEG compression support is not configured"), so we parse
+# the TIFF structure ourselves, walk IFD0 + all SubIFDs, and pull out the
+# largest embedded JPEG preview. The raw JPEG bytes are then decoded via
+# QImage.fromData, which works everywhere Qt's JPEG plugin does.
+
+_TIFF_TAG_IMAGE_WIDTH = 256
+_TIFF_TAG_IMAGE_LENGTH = 257
+_TIFF_TAG_COMPRESSION = 259
+_TIFF_TAG_STRIP_OFFSETS = 273
+_TIFF_TAG_STRIP_BYTE_COUNTS = 279
+_TIFF_TAG_SUB_IFDS = 330
+_TIFF_TAG_JPEG_IF_OFFSET = 513
+_TIFF_TAG_JPEG_IF_LENGTH = 514
+
+_TIFF_TYPE_SIZES = {
+    1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8,
+}
+
+
+def _extract_dng_jpeg_preview(path: str) -> Optional[bytes]:
+    """Return the largest embedded JPEG preview inside a DNG/TIFF file.
+
+    Returns raw JPEG bytes (starting with ``\\xff\\xd8``) on success, or None
+    if the file is not a TIFF-based container or contains no JPEG preview.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        logger.debug(f"DNG read failed ({path}): {e}")
+        return None
+
+    if len(data) < 8 or data[:2] not in (b"II", b"MM"):
+        return None
+    endian = "<" if data[:2] == b"II" else ">"
+    if struct.unpack(endian + "H", data[2:4])[0] != 42:
+        return None
+    first_ifd = struct.unpack(endian + "I", data[4:8])[0]
+
+    best: Optional[Tuple[int, bytes]] = None
+    visited: set = set()
+
+    def ifd_scalars(entries: Dict[int, Tuple[int, int, bytes]], tag: int) -> List[int]:
+        if tag not in entries:
+            return []
+        ttype, count, value_field = entries[tag]
+        size = _TIFF_TYPE_SIZES.get(ttype, 0) * count
+        if size == 0:
+            return []
+        if size <= 4:
+            buf = value_field[:size]
+        else:
+            off = struct.unpack(endian + "I", value_field)[0]
+            if off + size > len(data):
+                return []
+            buf = data[off:off + size]
+        if ttype == 3:
+            return list(struct.unpack(endian + f"{count}H", buf))
+        if ttype == 4:
+            return list(struct.unpack(endian + f"{count}I", buf))
+        if ttype == 1:
+            return list(buf)
+        return []
+
+    def walk(offset: int) -> None:
+        nonlocal best
+        if offset in visited or offset <= 0 or offset + 2 > len(data):
+            return
+        visited.add(offset)
+        try:
+            num_entries = struct.unpack(endian + "H", data[offset:offset + 2])[0]
+        except struct.error:
+            return
+        base = offset + 2
+        if base + num_entries * 12 > len(data):
+            return
+
+        entries: Dict[int, Tuple[int, int, bytes]] = {}
+        for i in range(num_entries):
+            eo = base + i * 12
+            tag, ttype, count = struct.unpack(endian + "HHI", data[eo:eo + 8])
+            entries[tag] = (ttype, count, data[eo + 8:eo + 12])
+
+        width = ifd_scalars(entries, _TIFF_TAG_IMAGE_WIDTH)
+        height = ifd_scalars(entries, _TIFF_TAG_IMAGE_LENGTH)
+        compression = ifd_scalars(entries, _TIFF_TAG_COMPRESSION)
+        strip_offsets = ifd_scalars(entries, _TIFF_TAG_STRIP_OFFSETS)
+        strip_counts = ifd_scalars(entries, _TIFF_TAG_STRIP_BYTE_COUNTS)
+        jpeg_if_off = ifd_scalars(entries, _TIFF_TAG_JPEG_IF_OFFSET)
+        jpeg_if_len = ifd_scalars(entries, _TIFF_TAG_JPEG_IF_LENGTH)
+
+        comp = compression[0] if compression else 0
+        area = (width[0] if width else 0) * (height[0] if height else 0)
+
+        payload: Optional[bytes] = None
+        if jpeg_if_off and jpeg_if_len:
+            off, ln = jpeg_if_off[0], jpeg_if_len[0]
+            if ln > 0 and off + ln <= len(data):
+                payload = data[off:off + ln]
+        elif comp == 7 and strip_offsets and strip_counts:
+            if len(strip_offsets) == 1:
+                off, ln = strip_offsets[0], strip_counts[0]
+                if ln > 0 and off + ln <= len(data):
+                    payload = data[off:off + ln]
+            else:
+                chunks = []
+                for off, ln in zip(strip_offsets, strip_counts):
+                    if ln > 0 and off + ln <= len(data):
+                        chunks.append(data[off:off + ln])
+                if chunks:
+                    payload = b"".join(chunks)
+
+        if payload and payload[:2] == b"\xff\xd8":
+            if best is None or area > best[0]:
+                best = (area, payload)
+
+        for sub_off in ifd_scalars(entries, _TIFF_TAG_SUB_IFDS):
+            walk(sub_off)
+
+        next_pos = base + num_entries * 12
+        if next_pos + 4 <= len(data):
+            next_off = struct.unpack(endian + "I", data[next_pos:next_pos + 4])[0]
+            if next_off:
+                walk(next_off)
+
+    walk(first_ifd)
+    return best[1] if best else None
+
+
+def _load_image_pixmap(path: str) -> QPixmap:
+    """Load a QPixmap for JPG/JPEG directly, or DNG via embedded JPEG preview."""
+    pix = QPixmap(path)
+    if not pix.isNull():
+        return pix
+    if path.lower().endswith(".dng"):
+        jpeg = _extract_dng_jpeg_preview(path)
+        if jpeg:
+            img = QImage.fromData(jpeg, "JPEG")
+            if not img.isNull():
+                return QPixmap.fromImage(img)
+    return QPixmap()
 
 
 # =============================================================================
@@ -90,14 +238,14 @@ class FacadeCornerSlot(QFrame):
 
     def set_path(self, path: Optional[str]) -> None:
         if path and os.path.isfile(path):
-            pix = QPixmap(path)
+            pix = _load_image_pixmap(path)
             if not pix.isNull():
                 self.thumb.setPixmap(
                     pix.scaled(72, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 )
             else:
                 self.thumb.clear()
-                self.thumb.setText("ERR")
+                self.thumb.setText("DNG" if path.lower().endswith(".dng") else "ERR")
             self.name_lbl.setText(Path(path).name[:16])
         else:
             self.thumb.clear()
@@ -116,7 +264,7 @@ class FacadeCornerSlot(QFrame):
         self._set_drag_over(False)
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if path.lower().endswith((".jpg", ".jpeg")) and os.path.isfile(path):
+            if path.lower().endswith((".jpg", ".jpeg", ".dng")) and os.path.isfile(path):
                 self.image_dropped.emit(self.slot_index, path)
                 break
 
@@ -208,7 +356,7 @@ class FacadeGridDropZone(QFrame):
     def scan_folder_images(folder: str) -> List[str]:
         images = []
         for f in sorted(os.listdir(folder)):
-            if f.lower().endswith((".jpg", ".jpeg")):
+            if f.lower().endswith((".jpg", ".jpeg", ".dng")):
                 images.append(os.path.join(folder, f))
         return images
 
@@ -505,7 +653,7 @@ class MainWindow(QMainWindow):
             self,
             "Select 4 images in order: BL → TL → TR → BR (facing wall)",
             "",
-            "Images (*.jpg *.jpeg *.JPG *.JPEG)",
+            "Images (*.jpg *.jpeg *.dng *.JPG *.JPEG *.DNG)",
         )
         if files:
             if len(files) != 4:
