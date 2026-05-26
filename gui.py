@@ -378,6 +378,8 @@ class MainWindow(QMainWindow):
         self.transformer: Optional[core.FacadeTransformer] = None
         self.flight_direction: str = ""
         self.corner_geometry_ok: bool = False
+        self.facade_width: Optional[float] = None
+        self.facade_height: Optional[float] = None
 
         # Central widget with scroll area
         scroll = QScrollArea()
@@ -401,6 +403,7 @@ class MainWindow(QMainWindow):
 
         # Initial state (default M3T locks FOV from profile)
         self._on_drone_type_changed()
+        self._update_capture_controls()
         self._update_ui_state()
 
     # -------------------------------------------------------------------------
@@ -523,6 +526,7 @@ class MainWindow(QMainWindow):
         self.spin_speed.setValue(4.0)
         self.spin_speed.setDecimals(1)
         self.spin_speed.setToolTip(f"{core.AUTO_FLIGHT_SPEED_MIN}–{core.AUTO_FLIGHT_SPEED_MAX} m/s")
+        self.spin_speed.valueChanged.connect(self._on_param_changed)
         layout.addWidget(self.spin_speed, 0, 1)
 
         layout.addWidget(QLabel("Gimbal Pitch (°):"), 0, 2)
@@ -530,15 +534,38 @@ class MainWindow(QMainWindow):
         self.spin_gimbal.setRange(-90.0, 30.0)
         self.spin_gimbal.setValue(0.0)
         self.spin_gimbal.setDecimals(1)
+        self.spin_gimbal.valueChanged.connect(self._on_param_changed)
         layout.addWidget(self.spin_gimbal, 0, 3)
 
-        self.chk_photo_capture = QCheckBox("Take Photo at Each Waypoint")
-        self.chk_photo_capture.setChecked(True)
-        self.chk_photo_capture.setToolTip(
-            "Add a takePhoto action at each waypoint after the drone pauses and adjusts gimbal"
+        layout.addWidget(QLabel("Capture Mode:"), 1, 0)
+        self.combo_capture_mode = QComboBox()
+        self.combo_capture_mode.addItem("Stop at each waypoint", "waypoint")
+        self.combo_capture_mode.addItem("Continuous by distance", "distance")
+        self.combo_capture_mode.addItem("Continuous by time", "time")
+        self.combo_capture_mode.addItem("No photo capture", "none")
+        self.combo_capture_mode.setToolTip(
+            "Waypoint mode pauses at each point. Continuous modes shoot while passing waypoints."
         )
-        self.chk_photo_capture.stateChanged.connect(self._on_param_changed)
-        layout.addWidget(self.chk_photo_capture, 1, 0, 1, 4)
+        self.combo_capture_mode.currentIndexChanged.connect(self._on_capture_mode_changed)
+        layout.addWidget(self.combo_capture_mode, 1, 1, 1, 3)
+
+        layout.addWidget(QLabel("Time Interval (s):"), 2, 0)
+        self.spin_capture_interval = QDoubleSpinBox()
+        self.spin_capture_interval.setRange(core.CAPTURE_TIME_INTERVAL_MIN, 60.0)
+        self.spin_capture_interval.setValue(core.CAPTURE_TIME_INTERVAL)
+        self.spin_capture_interval.setDecimals(1)
+        self.spin_capture_interval.setToolTip("M3T interval capture is usually stable at 2s or slower.")
+        self.spin_capture_interval.valueChanged.connect(self._on_param_changed)
+        layout.addWidget(self.spin_capture_interval, 2, 1)
+
+        self.btn_use_recommended_speed = QPushButton("Use Recommended Speed")
+        self.btn_use_recommended_speed.clicked.connect(self._apply_recommended_speed)
+        layout.addWidget(self.btn_use_recommended_speed, 2, 2, 1, 2)
+
+        self.lbl_capture_hint = QLabel("")
+        self.lbl_capture_hint.setWordWrap(True)
+        self.lbl_capture_hint.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(self.lbl_capture_hint, 3, 0, 1, 4)
 
         return group
 
@@ -692,6 +719,8 @@ class MainWindow(QMainWindow):
         self.image_paths = []
         self.gps_data = []
         self.corner_geometry_ok = False
+        self.facade_width = None
+        self.facade_height = None
         self.drop_zone.clear()
         self.txt_info.clear()
         if hasattr(self, "lbl_raw_order_warning"):
@@ -702,7 +731,77 @@ class MainWindow(QMainWindow):
 
     def _on_param_changed(self):
         """Handle parameter change - invalidate generation."""
+        if hasattr(self, "lbl_capture_hint"):
+            self._update_capture_controls()
         self._invalidate_generation()
+
+    def _on_capture_mode_changed(self):
+        """Update capture-mode dependent controls."""
+        self._update_capture_controls()
+        self._invalidate_generation()
+
+    def _estimated_direction(self) -> str:
+        if self.flight_direction:
+            return self.flight_direction
+        if (
+            self.chk_smart_planning.isChecked()
+            and self.facade_width is not None
+            and self.facade_height is not None
+        ):
+            return "vertical" if self.facade_height > self.facade_width else "horizontal"
+        return "horizontal"
+
+    def _capture_hint_values(self) -> Tuple[str, float, float, float]:
+        direction = self._estimated_direction()
+        distance = self.spin_photo_dist.value()
+        overlap = self.spin_overlap.value() / 100.0
+        hfov = core.radians(self.spin_hfov.value())
+        vfov = core.radians(self.spin_vfov.value())
+        fov = vfov if direction == "vertical" else hfov
+        coverage = max(2.0 * distance * core.tan(fov / 2.0), 0.01)
+        target_spacing = max(coverage * (1.0 - overlap), 0.01)
+        interval = self.spin_capture_interval.value()
+        recommended_speed = target_spacing / max(interval, core.CAPTURE_TIME_INTERVAL_MIN)
+        actual_spacing = self.spin_speed.value() * interval
+        actual_overlap = max(0.0, min(1.0, 1.0 - actual_spacing / coverage))
+        return direction, target_spacing, recommended_speed, actual_overlap
+
+    def _update_capture_controls(self):
+        """Refresh controls and estimate text for continuous capture."""
+        mode = self.combo_capture_mode.currentData()
+        is_time = mode == "time"
+        self.spin_capture_interval.setEnabled(is_time)
+        self.btn_use_recommended_speed.setEnabled(is_time)
+
+        direction, target_spacing, recommended_speed, actual_overlap = self._capture_hint_values()
+        if mode == "waypoint":
+            text = "Current mode: drone stops at each waypoint, then shoots. Highest positional accuracy."
+        elif mode == "distance":
+            text = (
+                f"Continuous distance mode: trigger every {target_spacing:.2f} m "
+                f"for {self.spin_overlap.value()}% target overlap ({direction} route)."
+            )
+        elif mode == "time":
+            interval = self.spin_capture_interval.value()
+            actual_spacing = self.spin_speed.value() * interval
+            text = (
+                f"Continuous time mode: {interval:.1f}s interval. Recommended speed "
+                f"{recommended_speed:.2f} m/s for {self.spin_overlap.value()}% overlap; "
+                f"current speed gives {actual_spacing:.2f} m/photo and about "
+                f"{actual_overlap * 100:.0f}% overlap ({direction} route)."
+            )
+        else:
+            text = "Current mode: no photo actions will be written to the KMZ."
+        self.lbl_capture_hint.setText(text)
+
+    def _apply_recommended_speed(self):
+        """Set speed from the current time interval and target overlap."""
+        _, _, recommended_speed, _ = self._capture_hint_values()
+        recommended_speed = max(
+            core.AUTO_FLIGHT_SPEED_MIN,
+            min(core.AUTO_FLIGHT_SPEED_MAX, recommended_speed),
+        )
+        self.spin_speed.setValue(recommended_speed)
 
     def _on_drone_type_changed(self, _text: Optional[str] = None):
         """M3 line presets: FOV fixed from profile, editors disabled."""
@@ -722,6 +821,8 @@ class MainWindow(QMainWindow):
         logger.debug("Extracting GPS data from images")
         self.gps_data = []
         self.corner_geometry_ok = False
+        self.facade_width = None
+        self.facade_height = None
         info_lines = []
 
         corner_labels = ("Bottom-Left BL", "Top-Left TL", "Top-Right TR", "Bottom-Right BR")
@@ -771,6 +872,8 @@ class MainWindow(QMainWindow):
                 zs = [p[2] for p in tf.facade_pts]
                 width = max(xs) - min(xs)
                 height = max(zs) - min(zs)
+                self.facade_width = width
+                self.facade_height = height
                 info_lines.append(f"\nFacade: {width:.1f}m × {height:.1f}m")
             except Exception as e:
                 logger.error(f"Facade analysis error: {e}")
@@ -815,7 +918,10 @@ class MainWindow(QMainWindow):
             core.FORCE_VERTICAL_PLANE = self.chk_force_vertical.isChecked()
             core.AUTO_FLIGHT_SPEED = self.spin_speed.value()
             core.GIMBAL_PITCH_DEG = self.spin_gimbal.value()
-            core.ENABLE_PHOTO_CAPTURE = self.chk_photo_capture.isChecked()
+            capture_mode = self.combo_capture_mode.currentData()
+            core.ENABLE_PHOTO_CAPTURE = capture_mode != "none"
+            core.CAPTURE_MODE = "waypoint" if capture_mode == "none" else capture_mode
+            core.CAPTURE_TIME_INTERVAL = self.spin_capture_interval.value()
 
             # Generate
             self.transformer, self.flight_direction, self.generated_waypoints = \
@@ -824,10 +930,12 @@ class MainWindow(QMainWindow):
             logger.success(f"Generated {len(self.generated_waypoints)} waypoints ({self.flight_direction} pattern)")
             status = (
                 f"Status: {len(self.generated_waypoints)} waypoints generated\n"
-                f"Direction: {self.flight_direction} snake pattern"
+                f"Direction: {self.flight_direction} snake pattern\n"
+                f"Capture: {self.combo_capture_mode.currentText()}"
             )
             self.lbl_gen_status.setText(status)
             self.lbl_gen_status.setStyleSheet("color: #4caf50;")
+            self._update_capture_controls()
 
         except Exception as e:
             logger.error(f"Generation failed: {e}")
@@ -869,8 +977,12 @@ class MainWindow(QMainWindow):
                 logger.success(f"Saved preview KML: {kml_path}")
 
             if mode in ("kmz", "both"):
-                waylines = core.build_waylines_wpml(self.transformer, self.generated_waypoints)
-                template = core.build_template_kml(self.transformer, self.generated_waypoints)
+                waylines = core.build_waylines_wpml(
+                    self.transformer, self.generated_waypoints, self.flight_direction
+                )
+                template = core.build_template_kml(
+                    self.transformer, self.generated_waypoints, self.flight_direction
+                )
                 kmz_path = os.path.join(output_dir, f"{mission_name}.kmz")
                 core.write_kmz(template, waylines, kmz_path)
                 saved_files.append(kmz_path)

@@ -96,6 +96,9 @@ def apply_drone_wpml_profile(drone_key: str) -> None:
 
 GIMBAL_PITCH_DEG = 0.0     # level shot at each point
 ENABLE_PHOTO_CAPTURE = True  # Take a photo at each waypoint pause
+CAPTURE_MODE = "waypoint"     # waypoint | distance | time
+CAPTURE_TIME_INTERVAL = 2.0   # seconds; M3T interval shooting is commonly limited to >= 2s
+CAPTURE_TIME_INTERVAL_MIN = 2.0
 # Waypoint heading: fixed = keep yaw between legs (lateral snake without nose-along-path yaw)
 WAYPOINT_HEADING_MODE = "fixed"
 HEIGHT_OFFSET = 0.0        # Constant offset added to all waypoint altitudes (meters)
@@ -372,6 +375,12 @@ def validate_planning_params() -> None:
         )
     if not (0.0 <= OVERLAP_RATE <= 1.0):
         raise ValueError("Overlap rate must be between 0% and 100% (inclusive).")
+    if CAPTURE_MODE not in {"waypoint", "distance", "time"}:
+        raise ValueError("Capture mode must be one of: waypoint, distance, time.")
+    if CAPTURE_MODE == "time" and CAPTURE_TIME_INTERVAL < CAPTURE_TIME_INTERVAL_MIN:
+        raise ValueError(
+            f"Time capture interval must be at least {CAPTURE_TIME_INTERVAL_MIN:.1f}s for M3T stability."
+        )
 
 
 def _cross2(ax: float, az: float, bx: float, bz: float) -> float:
@@ -670,6 +679,72 @@ def plan_steps(direction: str, distance: float, overlap: float):
     else:
         return fov_step(distance, VFOV_RAD, overlap), fov_step(distance, HFOV_RAD, overlap)
 
+
+def along_coverage(distance_m: float, direction: str) -> float:
+    fov = VFOV_RAD if direction == "vertical" else HFOV_RAD
+    return 2 * distance_m * tan(fov / 2.0)
+
+
+def capture_spacing_for_direction(direction: str) -> float:
+    return max(along_coverage(PHOTO_DISTANCE, direction) * (1.0 - OVERLAP_RATE), 0.01)
+
+
+def recommended_speed_for_time_capture(direction: str, interval_s: Optional[float] = None) -> float:
+    interval = interval_s if interval_s is not None else CAPTURE_TIME_INTERVAL
+    return capture_spacing_for_direction(direction) / max(interval, CAPTURE_TIME_INTERVAL_MIN)
+
+
+def overlap_for_spacing(direction: str, spacing_m: float) -> float:
+    coverage = max(along_coverage(PHOTO_DISTANCE, direction), 0.01)
+    return max(0.0, min(1.0, 1.0 - spacing_m / coverage))
+
+
+def _continuous_capture_config(direction: str) -> Optional[Tuple[str, float]]:
+    if not ENABLE_PHOTO_CAPTURE or CAPTURE_MODE == "waypoint":
+        return None
+    if CAPTURE_MODE == "distance":
+        return "multipleDistance", capture_spacing_for_direction(direction)
+    return "multipleTiming", max(CAPTURE_TIME_INTERVAL, CAPTURE_TIME_INTERVAL_MIN)
+
+
+def _turn_mode_for_capture() -> str:
+    if ENABLE_PHOTO_CAPTURE and CAPTURE_MODE in {"distance", "time"}:
+        return "toPointAndPassWithContinuityCurvature"
+    return "toPointAndStopWithDiscontinuityCurvature"
+
+
+def _turn_damping_for_capture() -> str:
+    if ENABLE_PHOTO_CAPTURE and CAPTURE_MODE in {"distance", "time"}:
+        return "0.2"
+    return "0"
+
+
+def _add_take_photo_action(parent, action_id: int, suffix: str) -> None:
+    act = SubElement(parent, "wpml:action")
+    SubElement(act, "wpml:actionId").text = str(action_id)
+    SubElement(act, "wpml:actionActuatorFunc").text = "takePhoto"
+    aparam = SubElement(act, "wpml:actionActuatorFuncParam")
+    SubElement(aparam, "wpml:payloadPositionIndex").text = "0"
+    SubElement(aparam, "wpml:fileSuffix").text = suffix
+    SubElement(aparam, "wpml:payloadLensIndex").text = "wide"
+    SubElement(aparam, "wpml:useGlobalPayloadLensIndex").text = "0"
+
+
+def _add_continuous_photo_group(parent, group_id: int, end_index: int, direction: str) -> None:
+    cfg = _continuous_capture_config(direction)
+    if cfg is None:
+        return
+    trigger_type, trigger_param = cfg
+    agroup = SubElement(parent, "wpml:actionGroup")
+    SubElement(agroup, "wpml:actionGroupId").text = str(group_id)
+    SubElement(agroup, "wpml:actionGroupStartIndex").text = "0"
+    SubElement(agroup, "wpml:actionGroupEndIndex").text = str(max(0, end_index))
+    SubElement(agroup, "wpml:actionGroupMode").text = "sequence"
+    atrigger = SubElement(agroup, "wpml:actionTrigger")
+    SubElement(atrigger, "wpml:actionTriggerType").text = trigger_type
+    SubElement(atrigger, "wpml:actionTriggerParam").text = f"{trigger_param:.2f}"
+    _add_take_photo_action(agroup, 0, "continuous")
+
 # =================== Build mission & outputs ===================
 
 def build_waypoints_from_images(images: List[str]):
@@ -759,7 +834,7 @@ def build_generic_kml(wps: List[Tuple[float,float,float]]):
 
 # ---------- Build waylines.wpml (execution) ----------
 
-def build_waylines_wpml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]]):
+def build_waylines_wpml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]], direction: str = "horizontal"):
     import time
     root = Element("kml")
     root.set("xmlns","http://www.opengis.net/kml/2.2")
@@ -808,6 +883,8 @@ def build_waylines_wpml(tf: FacadeTransformer, wps: List[Tuple[float,float,float
         bearing = degrees(atan2(east, north))
         return (bearing + 360.0) % 360.0
     head_deg = yaw_from_xy(to_wall)
+    turn_mode = _turn_mode_for_capture()
+    turn_damping = _turn_damping_for_capture()
 
     lat0,lon0,alt0 = tf.ref
 
@@ -845,59 +922,54 @@ def build_waylines_wpml(tf: FacadeTransformer, wps: List[Tuple[float,float,float
         
         # Waypoint turn param
         tparam = SubElement(pm, "wpml:waypointTurnParam")
-        SubElement(tparam, "wpml:waypointTurnMode").text = "toPointAndStopWithDiscontinuityCurvature"
-        SubElement(tparam, "wpml:waypointTurnDampingDist").text = "0"
+        SubElement(tparam, "wpml:waypointTurnMode").text = turn_mode
+        SubElement(tparam, "wpml:waypointTurnDampingDist").text = turn_damping
         
         SubElement(pm, "wpml:useStraightLine").text = "1"
-        
-        # Action group
-        agroup = SubElement(pm, "wpml:actionGroup")
-        SubElement(agroup, "wpml:actionGroupId").text = str(i)
-        SubElement(agroup, "wpml:actionGroupStartIndex").text = str(i)
-        SubElement(agroup, "wpml:actionGroupEndIndex").text = str(i)
-        SubElement(agroup, "wpml:actionGroupMode").text = "sequence"
-        
-        atrigger = SubElement(agroup, "wpml:actionTrigger")
-        SubElement(atrigger, "wpml:actionTriggerType").text = "reachPoint"
-        
-        # Rotate Yaw action
-        act1 = SubElement(agroup, "wpml:action")
-        SubElement(act1, "wpml:actionId").text = "0"
-        SubElement(act1, "wpml:actionActuatorFunc").text = "rotateYaw"
-        aparam1 = SubElement(act1, "wpml:actionActuatorFuncParam")
-        SubElement(aparam1, "wpml:aircraftHeading").text = f"{head_deg:.1f}"
-        SubElement(aparam1, "wpml:aircraftPathMode").text = "counterClockwise"
-        
-        # Gimbal Rotate action
-        act2 = SubElement(agroup, "wpml:action")
-        SubElement(act2, "wpml:actionId").text = "1"
-        SubElement(act2, "wpml:actionActuatorFunc").text = "gimbalRotate"
-        aparam2 = SubElement(act2, "wpml:actionActuatorFuncParam")
-        SubElement(aparam2, "wpml:gimbalHeadingYawBase").text = "north"
-        SubElement(aparam2, "wpml:gimbalRotateMode").text = "absoluteAngle"
-        SubElement(aparam2, "wpml:gimbalPitchRotateEnable").text = "1"
-        SubElement(aparam2, "wpml:gimbalPitchRotateAngle").text = f"{GIMBAL_PITCH_DEG:.0f}"
-        SubElement(aparam2, "wpml:gimbalRollRotateEnable").text = "0"
-        SubElement(aparam2, "wpml:gimbalRollRotateAngle").text = "0"
-        SubElement(aparam2, "wpml:gimbalYawRotateEnable").text = "0"
-        SubElement(aparam2, "wpml:gimbalYawRotateAngle").text = "0"
-        SubElement(aparam2, "wpml:gimbalRotateTimeEnable").text = "0"
-        SubElement(aparam2, "wpml:gimbalRotateTime").text = "0"
-        SubElement(aparam2, "wpml:payloadPositionIndex").text = "0"
 
-        if ENABLE_PHOTO_CAPTURE:
-            act3 = SubElement(agroup, "wpml:action")
-            SubElement(act3, "wpml:actionId").text = "2"
-            SubElement(act3, "wpml:actionActuatorFunc").text = "takePhoto"
-            aparam3 = SubElement(act3, "wpml:actionActuatorFuncParam")
-            SubElement(aparam3, "wpml:payloadPositionIndex").text = "0"
-            SubElement(aparam3, "wpml:fileSuffix").text = "point"
-            SubElement(aparam3, "wpml:payloadLensIndex").text = "wide"
-            SubElement(aparam3, "wpml:useGlobalPayloadLensIndex").text = "0"
+        if ENABLE_PHOTO_CAPTURE and CAPTURE_MODE == "waypoint":
+            # Action group
+            agroup = SubElement(pm, "wpml:actionGroup")
+            SubElement(agroup, "wpml:actionGroupId").text = str(i)
+            SubElement(agroup, "wpml:actionGroupStartIndex").text = str(i)
+            SubElement(agroup, "wpml:actionGroupEndIndex").text = str(i)
+            SubElement(agroup, "wpml:actionGroupMode").text = "sequence"
+
+            atrigger = SubElement(agroup, "wpml:actionTrigger")
+            SubElement(atrigger, "wpml:actionTriggerType").text = "reachPoint"
+
+            # Rotate Yaw action
+            act1 = SubElement(agroup, "wpml:action")
+            SubElement(act1, "wpml:actionId").text = "0"
+            SubElement(act1, "wpml:actionActuatorFunc").text = "rotateYaw"
+            aparam1 = SubElement(act1, "wpml:actionActuatorFuncParam")
+            SubElement(aparam1, "wpml:aircraftHeading").text = f"{head_deg:.1f}"
+            SubElement(aparam1, "wpml:aircraftPathMode").text = "counterClockwise"
+
+            # Gimbal Rotate action
+            act2 = SubElement(agroup, "wpml:action")
+            SubElement(act2, "wpml:actionId").text = "1"
+            SubElement(act2, "wpml:actionActuatorFunc").text = "gimbalRotate"
+            aparam2 = SubElement(act2, "wpml:actionActuatorFuncParam")
+            SubElement(aparam2, "wpml:gimbalHeadingYawBase").text = "north"
+            SubElement(aparam2, "wpml:gimbalRotateMode").text = "absoluteAngle"
+            SubElement(aparam2, "wpml:gimbalPitchRotateEnable").text = "1"
+            SubElement(aparam2, "wpml:gimbalPitchRotateAngle").text = f"{GIMBAL_PITCH_DEG:.0f}"
+            SubElement(aparam2, "wpml:gimbalRollRotateEnable").text = "0"
+            SubElement(aparam2, "wpml:gimbalRollRotateAngle").text = "0"
+            SubElement(aparam2, "wpml:gimbalYawRotateEnable").text = "0"
+            SubElement(aparam2, "wpml:gimbalYawRotateAngle").text = "0"
+            SubElement(aparam2, "wpml:gimbalRotateTimeEnable").text = "0"
+            SubElement(aparam2, "wpml:gimbalRotateTime").text = "0"
+            SubElement(aparam2, "wpml:payloadPositionIndex").text = "0"
+
+            _add_take_photo_action(agroup, 2, "point")
+        elif i == 0:
+            _add_continuous_photo_group(pm, 0, len(wps) - 1, direction)
 
         # Gimbal heading param
         ghparam = SubElement(pm, "wpml:waypointGimbalHeadingParam")
-        SubElement(ghparam, "wpml:waypointGimbalPitchAngle").text = "0"
+        SubElement(ghparam, "wpml:waypointGimbalPitchAngle").text = f"{GIMBAL_PITCH_DEG:.0f}"
         SubElement(ghparam, "wpml:waypointGimbalYawAngle").text = "0"
         
         SubElement(pm, "wpml:isRisky").text = "0"
@@ -907,7 +979,7 @@ def build_waylines_wpml(tf: FacadeTransformer, wps: List[Tuple[float,float,float
 
 # ---------- Build template.kml (editor) ----------
 
-def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]]):
+def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]], direction: str = "horizontal"):
     import time
     root = Element("kml")
     root.set("xmlns","http://www.opengis.net/kml/2.2")
@@ -965,7 +1037,8 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
     SubElement(folder, "wpml:globalHeight").text = f"{avg_height:.9f}"
     
     SubElement(folder, "wpml:caliFlightEnable").text = "0"
-    SubElement(folder, "wpml:gimbalPitchMode").text = "manual"
+    gimbal_pitch_mode = "usePointSetting" if CAPTURE_MODE in {"distance", "time"} else "manual"
+    SubElement(folder, "wpml:gimbalPitchMode").text = gimbal_pitch_mode
 
     # Heading facing wall: Y' points toward facade, so drone faces in Y' direction
     R = tf.R; yprime_enu = np.array(R[1], dtype=float)
@@ -977,6 +1050,8 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
         bearing = degrees(atan2(east, north))
         return (bearing + 360.0) % 360.0
     head_deg = yaw_from_xy(to_wall)
+    turn_mode = _turn_mode_for_capture()
+    turn_damping = _turn_damping_for_capture()
     
     # Global waypoint heading param — fixed at facade-facing yaw for sideways flight
     ghparam = SubElement(folder, "wpml:globalWaypointHeadingParam")
@@ -986,7 +1061,7 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
     SubElement(ghparam, "wpml:waypointHeadingPathMode").text = "followBadArc"
     SubElement(ghparam, "wpml:waypointHeadingPoiIndex").text = "0"
     
-    SubElement(folder, "wpml:globalWaypointTurnMode").text = "toPointAndStopWithDiscontinuityCurvature"
+    SubElement(folder, "wpml:globalWaypointTurnMode").text = turn_mode
     SubElement(folder, "wpml:globalUseStraightLine").text = "1"
 
     # Waypoints
@@ -1025,60 +1100,58 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
         
         # Waypoint turn param
         tparam = SubElement(pm, "wpml:waypointTurnParam")
-        SubElement(tparam, "wpml:waypointTurnMode").text = "toPointAndStopWithDiscontinuityCurvature"
-        SubElement(tparam, "wpml:waypointTurnDampingDist").text = "0.2"
+        SubElement(tparam, "wpml:waypointTurnMode").text = turn_mode
+        SubElement(tparam, "wpml:waypointTurnDampingDist").text = turn_damping
         
         # Use global settings (but NOT for height - each waypoint has different height)
         SubElement(pm, "wpml:useGlobalHeight").text = "0"  # ✓ 修复：使用各自高度
         SubElement(pm, "wpml:useGlobalSpeed").text = "1"
         SubElement(pm, "wpml:useGlobalHeadingParam").text = "1"
-        SubElement(pm, "wpml:useGlobalTurnParam").text = "1"
+        SubElement(pm, "wpml:useGlobalTurnParam").text = "0" if CAPTURE_MODE in {"distance", "time"} else "1"
         SubElement(pm, "wpml:useStraightLine").text = "1"
-        
-        # Action group
-        agroup = SubElement(pm, "wpml:actionGroup")
-        SubElement(agroup, "wpml:actionGroupId").text = str(i)
-        SubElement(agroup, "wpml:actionGroupStartIndex").text = str(i)
-        SubElement(agroup, "wpml:actionGroupEndIndex").text = str(i)
-        SubElement(agroup, "wpml:actionGroupMode").text = "sequence"
-        
-        atrigger = SubElement(agroup, "wpml:actionTrigger")
-        SubElement(atrigger, "wpml:actionTriggerType").text = "reachPoint"
-        
-        # Rotate Yaw action
-        act1 = SubElement(agroup, "wpml:action")
-        SubElement(act1, "wpml:actionId").text = "0"
-        SubElement(act1, "wpml:actionActuatorFunc").text = "rotateYaw"
-        aparam1 = SubElement(act1, "wpml:actionActuatorFuncParam")
-        SubElement(aparam1, "wpml:aircraftHeading").text = f"{head_deg:.1f}"
-        SubElement(aparam1, "wpml:aircraftPathMode").text = "counterClockwise"
-        
-        # Gimbal Rotate action
-        act2 = SubElement(agroup, "wpml:action")
-        SubElement(act2, "wpml:actionId").text = "1"
-        SubElement(act2, "wpml:actionActuatorFunc").text = "gimbalRotate"
-        aparam2 = SubElement(act2, "wpml:actionActuatorFuncParam")
-        SubElement(aparam2, "wpml:gimbalHeadingYawBase").text = "north"
-        SubElement(aparam2, "wpml:gimbalRotateMode").text = "absoluteAngle"
-        SubElement(aparam2, "wpml:gimbalPitchRotateEnable").text = "1"
-        SubElement(aparam2, "wpml:gimbalPitchRotateAngle").text = f"{GIMBAL_PITCH_DEG:.0f}"
-        SubElement(aparam2, "wpml:gimbalRollRotateEnable").text = "0"
-        SubElement(aparam2, "wpml:gimbalRollRotateAngle").text = "0"
-        SubElement(aparam2, "wpml:gimbalYawRotateEnable").text = "0"
-        SubElement(aparam2, "wpml:gimbalYawRotateAngle").text = "0"
-        SubElement(aparam2, "wpml:gimbalRotateTimeEnable").text = "0"
-        SubElement(aparam2, "wpml:gimbalRotateTime").text = "0"
-        SubElement(aparam2, "wpml:payloadPositionIndex").text = "0"
 
-        if ENABLE_PHOTO_CAPTURE:
-            act3 = SubElement(agroup, "wpml:action")
-            SubElement(act3, "wpml:actionId").text = "2"
-            SubElement(act3, "wpml:actionActuatorFunc").text = "takePhoto"
-            aparam3 = SubElement(act3, "wpml:actionActuatorFuncParam")
-            SubElement(aparam3, "wpml:payloadPositionIndex").text = "0"
-            SubElement(aparam3, "wpml:fileSuffix").text = "point"
-            SubElement(aparam3, "wpml:payloadLensIndex").text = "wide"
-            SubElement(aparam3, "wpml:useGlobalPayloadLensIndex").text = "0"
+        if CAPTURE_MODE in {"distance", "time"}:
+            SubElement(pm, "wpml:gimbalPitchAngle").text = f"{GIMBAL_PITCH_DEG:.0f}"
+
+        if ENABLE_PHOTO_CAPTURE and CAPTURE_MODE == "waypoint":
+            # Action group
+            agroup = SubElement(pm, "wpml:actionGroup")
+            SubElement(agroup, "wpml:actionGroupId").text = str(i)
+            SubElement(agroup, "wpml:actionGroupStartIndex").text = str(i)
+            SubElement(agroup, "wpml:actionGroupEndIndex").text = str(i)
+            SubElement(agroup, "wpml:actionGroupMode").text = "sequence"
+
+            atrigger = SubElement(agroup, "wpml:actionTrigger")
+            SubElement(atrigger, "wpml:actionTriggerType").text = "reachPoint"
+
+            # Rotate Yaw action
+            act1 = SubElement(agroup, "wpml:action")
+            SubElement(act1, "wpml:actionId").text = "0"
+            SubElement(act1, "wpml:actionActuatorFunc").text = "rotateYaw"
+            aparam1 = SubElement(act1, "wpml:actionActuatorFuncParam")
+            SubElement(aparam1, "wpml:aircraftHeading").text = f"{head_deg:.1f}"
+            SubElement(aparam1, "wpml:aircraftPathMode").text = "counterClockwise"
+
+            # Gimbal Rotate action
+            act2 = SubElement(agroup, "wpml:action")
+            SubElement(act2, "wpml:actionId").text = "1"
+            SubElement(act2, "wpml:actionActuatorFunc").text = "gimbalRotate"
+            aparam2 = SubElement(act2, "wpml:actionActuatorFuncParam")
+            SubElement(aparam2, "wpml:gimbalHeadingYawBase").text = "north"
+            SubElement(aparam2, "wpml:gimbalRotateMode").text = "absoluteAngle"
+            SubElement(aparam2, "wpml:gimbalPitchRotateEnable").text = "1"
+            SubElement(aparam2, "wpml:gimbalPitchRotateAngle").text = f"{GIMBAL_PITCH_DEG:.0f}"
+            SubElement(aparam2, "wpml:gimbalRollRotateEnable").text = "0"
+            SubElement(aparam2, "wpml:gimbalRollRotateAngle").text = "0"
+            SubElement(aparam2, "wpml:gimbalYawRotateEnable").text = "0"
+            SubElement(aparam2, "wpml:gimbalYawRotateAngle").text = "0"
+            SubElement(aparam2, "wpml:gimbalRotateTimeEnable").text = "0"
+            SubElement(aparam2, "wpml:gimbalRotateTime").text = "0"
+            SubElement(aparam2, "wpml:payloadPositionIndex").text = "0"
+
+            _add_take_photo_action(agroup, 2, "point")
+        elif i == 0:
+            _add_continuous_photo_group(pm, 0, len(wps) - 1, direction)
 
         SubElement(pm, "wpml:isRisky").text = "0"
     
@@ -1153,8 +1226,8 @@ def main(argv: List[str]):
     logger.success(f"Saved preview: {preview_path}")
 
     # KMZ (wpmz/template.kml + wpmz/waylines.wpml)
-    waylines = build_waylines_wpml(tf, wps)
-    template = build_template_kml(tf, wps)
+    waylines = build_waylines_wpml(tf, wps, direction)
+    template = build_template_kml(tf, wps, direction)
     kmz_file = f"{mission_name}.kmz"
     write_kmz(template, waylines, kmz_file)
 
