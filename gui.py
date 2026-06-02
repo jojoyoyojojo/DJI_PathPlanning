@@ -464,8 +464,8 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Drone Type:"), 0, 0)
         self.combo_drone = QComboBox()
-        self.combo_drone.addItems(["M3E", "M3T"])
-        self.combo_drone.setCurrentText("M3T")
+        self.combo_drone.addItems(core.DRONE_WPML_PROFILES.keys())
+        self.combo_drone.setCurrentText(core.DRONE_TYPE)
         self.combo_drone.currentTextChanged.connect(self._on_drone_type_changed)
         self.combo_drone.currentTextChanged.connect(self._on_param_changed)
         layout.addWidget(self.combo_drone, 0, 1, 1, 3)
@@ -804,9 +804,11 @@ class MainWindow(QMainWindow):
         self.spin_speed.setValue(recommended_speed)
 
     def _on_drone_type_changed(self, _text: Optional[str] = None):
-        """M3 line presets: FOV fixed from profile, editors disabled."""
+        """Apply selected aircraft/payload profile and lock FOV to the preset."""
         dt = self.combo_drone.currentText()
         prof = core.DRONE_WPML_PROFILES[dt]
+        core.DRONE_TYPE = dt
+        core.apply_drone_wpml_profile(dt)
         self.spin_hfov.blockSignals(True)
         self.spin_vfov.blockSignals(True)
         self.spin_hfov.setValue(float(prof["hfov"]))
@@ -908,6 +910,9 @@ class MainWindow(QMainWindow):
             logger.debug(f"Parameters: distance={self.spin_photo_dist.value()}")
             logger.debug(f"Parameters: HFOV={self.spin_hfov.value()}, VFOV={self.spin_vfov.value()}, overlap={self.spin_overlap.value()}")
             logger.debug(f"Parameters: force_vertical={self.chk_force_vertical.isChecked()}, smart_planning={self.chk_smart_planning.isChecked()}")
+            drone_type = self.combo_drone.currentText()
+            core.DRONE_TYPE = drone_type
+            core.apply_drone_wpml_profile(drone_type)
             core.PHOTO_DISTANCE = self.spin_photo_dist.value()
             core.CAMERA_HFOV = self.spin_hfov.value()
             core.CAMERA_VFOV = self.spin_vfov.value()
@@ -930,6 +935,7 @@ class MainWindow(QMainWindow):
             logger.success(f"Generated {len(self.generated_waypoints)} waypoints ({self.flight_direction} pattern)")
             status = (
                 f"Status: {len(self.generated_waypoints)} waypoints generated\n"
+                f"Drone: {drone_type}\n"
                 f"Direction: {self.flight_direction} snake pattern\n"
                 f"Capture: {self.combo_capture_mode.currentText()}"
             )

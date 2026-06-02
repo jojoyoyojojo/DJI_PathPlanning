@@ -61,21 +61,22 @@ CAMERA_VFOV = 56.8
 DRONE_TYPE = "M3T"
 AUTO_FLIGHT_SPEED = 4.0
 
-# Mavic 3 Enterprise series → FOV + WPML ids (verified for M3 line)
+# Mavic 3 Enterprise series → FOV + WPML ids.
+# DJI WPML uses aircraft enum 77 for M3E/M3T/M3M; enum 67 is M30/M30T.
 DRONE_WPML_PROFILES: Dict[str, Dict[str, Any]] = {
     "M3E": {
         "hfov": 71.5, "vfov": 56.8,
-        "drone": "67", "drone_sub": "0", "payload": "52", "payload_sub": "0",
+        "drone": "77", "drone_sub": "0", "payload": "66", "payload_sub": "0",
     },
     "M3T": {
         "hfov": 71.5, "vfov": 56.8,
-        "drone": "67", "drone_sub": "1", "payload": "52", "payload_sub": "0",
+        "drone": "77", "drone_sub": "1", "payload": "67", "payload_sub": "0",
     },
 }
 
-WPML_DRONE_ENUM = "67"
+WPML_DRONE_ENUM = "77"
 WPML_DRONE_SUB_ENUM = "1"
-WPML_PAYLOAD_ENUM = "52"
+WPML_PAYLOAD_ENUM = "67"
 WPML_PAYLOAD_SUB_ENUM = "0"
 
 

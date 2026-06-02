@@ -130,4 +130,4 @@ DJI missions require separate height references:
 ### WPML 1.0.6 Compliance
 - XML must include proper namespace declarations
 - Files must be in `wpmz/` subdirectory within KMZ
-- Drone type 67 = Mavic 3T
+- Drone type 77 / subtype 1 = Mavic 3T

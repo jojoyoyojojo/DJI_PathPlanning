@@ -61,7 +61,7 @@ DJI drone mission planning tool for Mavic 3T facade photography. Converts RTK-en
 
 ### DJI WPML 1.0.6 Format
 - KMZ must contain `wpmz/` subdirectory with `template.kml` and `waylines.wpml`
-- Drone type 67 = Mavic 3T
+- Drone type 77 / subtype 1 = Mavic 3T
 - Supports snake-pattern waypoint generation with configurable overlap
 
 ## Important Constraints

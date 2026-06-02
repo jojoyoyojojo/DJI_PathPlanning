@@ -64,9 +64,9 @@
 
 ### Drone Type
 
-`Drone Type` 允许用户选择 `M3E` 或 `M3T`。当前默认选择 `M3T`。
+`Drone Type` 的可选项来自 `mavic3T_pp_kmz.py` 中的 `DRONE_WPML_PROFILES`。当前默认选择 `M3T`；如果在 profile 中新增其他 DJI WPML 机型，它会自动出现在下拉框中。
 
-选择机型后，程序会自动读取该机型对应的相机参数和 WPML 配置。HFOV 和 VFOV 会根据机型预设自动填入，并在界面上锁定，避免用户误改官方或项目预设的相机视场角。
+选择机型后，程序会自动读取该机型对应的相机参数和 WPML 配置，包括无人机 enum、负载 enum、HFOV 和 VFOV。HFOV 和 VFOV 会根据机型预设自动填入，并在界面上锁定，避免用户误改官方或项目预设的相机视场角。
 
 ### HFOV 和 VFOV
 

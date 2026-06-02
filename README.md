@@ -14,7 +14,7 @@
 ## 系统要求
 
 - Python 3.12
-- DJI Mavic 3T (无人机类型 67)
+- DJI Mavic 3T (无人机类型 77 / 子类型 1)
 
 ## 安装
 
@@ -118,8 +118,14 @@ GPS (EXIF 中的 WGS84)
 
 - 文件必须放在 KMZ 内的 `wpmz/` 子目录
 - XML 命名空间：`http://www.dji.com/wpmz/1.0.6`
-- 无人机枚举值：67 (Mavic 3T)
-- 相机枚举值：52
+- 无人机枚举值：77 / 1 (Mavic 3T)
+- 相机枚举值：67 (Mavic 3T Camera)
+
+机型、负载和相机 FOV 统一维护在 `mavic3T_pp_kmz.py` 的
+`DRONE_WPML_PROFILES` 中。GUI 的 `Drone Type` 下拉框会自动读取这组
+profile；如果要支持其他 DJI WPML 机型，新增一组官方 `drone` /
+`drone_sub` / `payload` / `payload_sub` 枚举，并确认该机型的 HFOV、VFOV、
+拍照动作和最小拍照间隔与航线设置兼容。
 
 ### KMZ 文件结构
 
