@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Mavic 3T Facade Waypoint Planner → KMZ (DJI WPML standard package)
+AeroFacade Studio → KMZ (DJI WPML standard package)
 
 What this script does
 - Reads 4 facade-corner photos' EXIF GPS (Lat/Lon/Alt) taken ~5 m from wall
@@ -24,6 +24,7 @@ For EGM96, plug your geoid model in `egm96_geoid_offset(lat, lon)`.
 import sys
 import exifread
 import os
+import re
 from math import radians, cos, tan, sqrt, degrees, atan2, hypot
 from pathlib import Path
 from xml.etree.ElementTree import Element, SubElement, ElementTree, tostring
@@ -58,8 +59,15 @@ CAMERA_HFOV = 71.5
 CAMERA_VFOV = 56.8
 
 # DJI / WPML params
-DRONE_TYPE = "M3T"
+DRONE_TYPE = "M3E"
 AUTO_FLIGHT_SPEED = 4.0
+MISSION_FINISH_ACTION = "noAction"
+MISSION_EXIT_ON_RC_LOST = "executeLostAction"
+MISSION_EXECUTE_RC_LOST_ACTION = "hover"
+TAKE_OFF_SECURITY_HEIGHT = 80.0
+GLOBAL_TRANSITIONAL_SPEED = 5.0
+POSITIONING_TYPE = "GPS"
+IMAGE_FORMAT = "wide"
 
 # Mavic 3 Enterprise series → FOV + WPML ids.
 # DJI WPML uses aircraft enum 77 for M3E/M3T/M3M; enum 67 is M30/M30T.
@@ -75,8 +83,8 @@ DRONE_WPML_PROFILES: Dict[str, Dict[str, Any]] = {
 }
 
 WPML_DRONE_ENUM = "77"
-WPML_DRONE_SUB_ENUM = "1"
-WPML_PAYLOAD_ENUM = "67"
+WPML_DRONE_SUB_ENUM = "0"
+WPML_PAYLOAD_ENUM = "66"
 WPML_PAYLOAD_SUB_ENUM = "0"
 
 
@@ -96,8 +104,8 @@ def apply_drone_wpml_profile(drone_key: str) -> None:
 
 
 GIMBAL_PITCH_DEG = 0.0     # level shot at each point
-ENABLE_PHOTO_CAPTURE = True  # Take a photo at each waypoint pause
-CAPTURE_MODE = "waypoint"     # waypoint | distance | time
+ENABLE_PHOTO_CAPTURE = True  # Write camera actions for photo/video capture
+CAPTURE_MODE = "time"         # time | waypoint | video | none
 CAPTURE_TIME_INTERVAL = 2.0   # seconds; M3T interval shooting is commonly limited to >= 2s
 CAPTURE_TIME_INTERVAL_MIN = 2.0
 # Waypoint heading: fixed = keep yaw between legs (lateral snake without nose-along-path yaw)
@@ -179,8 +187,38 @@ def _dms_to_deg(dms, ref):
     return sign * (d + m/60 + s/3600)
 
 
-def read_gps(path: str) -> Tuple[float, float, float]:
-    logger.debug(f"Reading GPS from: {path}")
+def _tag_text(tags: Dict[str, Any], *names: str) -> Optional[str]:
+    for name in names:
+        tag = tags.get(name)
+        if tag is None:
+            continue
+        text = getattr(tag, "printable", None) or str(tag)
+        text = text.strip().strip("\x00")
+        if text:
+            return text
+    return None
+
+
+def _raw_xmp_text(path: str, field_name: str) -> Optional[str]:
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except Exception:
+        return None
+    text = raw.decode("utf-8", errors="ignore")
+    patterns = (
+        rf'(?:drone-dji:)?{re.escape(field_name)}="([^"]+)"',
+        rf"<(?:drone-dji:)?{re.escape(field_name)}>([^<]+)</",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def read_photo_metadata(path: str) -> Dict[str, Any]:
+    logger.debug(f"Reading GPS metadata from: {path}")
     with open(path, "rb") as f:
         tags = exifread.process_file(f, details=False)
     lat = _dms_to_deg(tags["GPS GPSLatitude"].values, tags["GPS GPSLatitudeRef"].printable)
@@ -200,8 +238,41 @@ def read_gps(path: str) -> Tuple[float, float, float]:
             alt = -alt
     else:
         alt = 0.0
-    logger.info(f"GPS extracted: lat={lat:.6f}, lon={lon:.6f}, alt={alt:.2f}m")
+    # DJI writes RTK state in XMP. Prefer it over standard EXIF GPSStatus,
+    # which is often only A/V and would otherwise mask drone-dji:GpsStatus.
+    gps_status = (
+        _raw_xmp_text(path, "GpsStatus")
+        or _raw_xmp_text(path, "GPSStatus")
+        or _tag_text(tags, "GPS GPSStatus", "Image GPSStatus", "GPSStatus")
+    )
+    rtk_flag = (
+        _raw_xmp_text(path, "RtkFlag")
+        or _tag_text(tags, "Image Tag 0xC6F8", "drone-dji:RtkFlag", "RtkFlag")
+    )
+    is_rtk_fix = (gps_status or "").upper() == "RTK" and (rtk_flag or "") == "50"
+    logger.info(
+        f"GPS extracted: lat={lat:.6f}, lon={lon:.6f}, alt={alt:.2f}m, "
+        f"GPSStatus={gps_status or 'unknown'}, RtkFlag={rtk_flag or 'unknown'}"
+    )
+    return {
+        "lat": lat,
+        "lon": lon,
+        "alt": alt,
+        "gps_status": gps_status,
+        "rtk_flag": rtk_flag,
+        "is_rtk_fix": is_rtk_fix,
+    }
+
+
+def read_gps(path: str) -> Tuple[float, float, float]:
+    meta = read_photo_metadata(path)
+    lat, lon, alt = meta["lat"], meta["lon"], meta["alt"]
     return lat, lon, alt
+
+
+def positioning_type_from_images(images: List[str]) -> str:
+    metas = [read_photo_metadata(p) for p in images]
+    return "RTKBaseStation" if metas and all(m["is_rtk_fix"] for m in metas) else "GPS"
 
 # ================= ENU & Facade Frame (approx) =================
 
@@ -376,8 +447,8 @@ def validate_planning_params() -> None:
         )
     if not (0.0 <= OVERLAP_RATE <= 1.0):
         raise ValueError("Overlap rate must be between 0% and 100% (inclusive).")
-    if CAPTURE_MODE not in {"waypoint", "distance", "time"}:
-        raise ValueError("Capture mode must be one of: waypoint, distance, time.")
+    if CAPTURE_MODE not in {"time", "waypoint", "video", "none"}:
+        raise ValueError("Capture mode must be one of: time, waypoint, video, none.")
     if CAPTURE_MODE == "time" and CAPTURE_TIME_INTERVAL < CAPTURE_TIME_INTERVAL_MIN:
         raise ValueError(
             f"Time capture interval must be at least {CAPTURE_TIME_INTERVAL_MIN:.1f}s for M3T stability."
@@ -701,23 +772,30 @@ def overlap_for_spacing(direction: str, spacing_m: float) -> float:
 
 
 def _continuous_capture_config(direction: str) -> Optional[Tuple[str, float]]:
-    if not ENABLE_PHOTO_CAPTURE or CAPTURE_MODE == "waypoint":
+    if not ENABLE_PHOTO_CAPTURE or CAPTURE_MODE != "time":
         return None
-    if CAPTURE_MODE == "distance":
-        return "multipleDistance", capture_spacing_for_direction(direction)
     return "multipleTiming", max(CAPTURE_TIME_INTERVAL, CAPTURE_TIME_INTERVAL_MIN)
 
 
 def _turn_mode_for_capture() -> str:
-    if ENABLE_PHOTO_CAPTURE and CAPTURE_MODE in {"distance", "time"}:
+    if CAPTURE_MODE == "video":
         return "toPointAndPassWithContinuityCurvature"
     return "toPointAndStopWithDiscontinuityCurvature"
 
 
 def _turn_damping_for_capture() -> str:
-    if ENABLE_PHOTO_CAPTURE and CAPTURE_MODE in {"distance", "time"}:
+    if CAPTURE_MODE == "video":
         return "0.2"
     return "0"
+
+
+def _wpml_number(value: float) -> str:
+    value = float(value)
+    return str(int(value)) if value.is_integer() else f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _action_payload_lens_index() -> str:
+    return IMAGE_FORMAT.replace("visible", "wide")
 
 
 def _add_take_photo_action(parent, action_id: int, suffix: str) -> None:
@@ -727,8 +805,18 @@ def _add_take_photo_action(parent, action_id: int, suffix: str) -> None:
     aparam = SubElement(act, "wpml:actionActuatorFuncParam")
     SubElement(aparam, "wpml:payloadPositionIndex").text = "0"
     SubElement(aparam, "wpml:fileSuffix").text = suffix
-    SubElement(aparam, "wpml:payloadLensIndex").text = "wide"
+    SubElement(aparam, "wpml:payloadLensIndex").text = _action_payload_lens_index()
     SubElement(aparam, "wpml:useGlobalPayloadLensIndex").text = "0"
+
+
+def _add_record_action(parent, action_id: int, action: str, suffix: Optional[str] = None) -> None:
+    act = SubElement(parent, "wpml:action")
+    SubElement(act, "wpml:actionId").text = str(action_id)
+    SubElement(act, "wpml:actionActuatorFunc").text = action
+    aparam = SubElement(act, "wpml:actionActuatorFuncParam")
+    if suffix is not None:
+        SubElement(aparam, "wpml:fileSuffix").text = suffix
+    SubElement(aparam, "wpml:payloadPositionIndex").text = "0"
 
 
 def _add_continuous_photo_group(parent, group_id: int, end_index: int, direction: str) -> None:
@@ -746,12 +834,27 @@ def _add_continuous_photo_group(parent, group_id: int, end_index: int, direction
     SubElement(atrigger, "wpml:actionTriggerParam").text = f"{trigger_param:.2f}"
     _add_take_photo_action(agroup, 0, "continuous")
 
+
+def _add_video_record_group(parent, group_id: int, index: int, action: str) -> None:
+    agroup = SubElement(parent, "wpml:actionGroup")
+    SubElement(agroup, "wpml:actionGroupId").text = str(group_id)
+    SubElement(agroup, "wpml:actionGroupStartIndex").text = str(index)
+    SubElement(agroup, "wpml:actionGroupEndIndex").text = str(index)
+    SubElement(agroup, "wpml:actionGroupMode").text = "sequence"
+    atrigger = SubElement(agroup, "wpml:actionTrigger")
+    SubElement(atrigger, "wpml:actionTriggerType").text = "reachPoint"
+    suffix = "video" if action == "startRecord" else None
+    _add_record_action(agroup, 0, action, suffix)
+
 # =================== Build mission & outputs ===================
 
 def build_waypoints_from_images(images: List[str]):
+    global POSITIONING_TYPE
     validate_planning_params()
     logger.info(f"Building waypoints from {len(images)} images")
-    gps4=[read_gps(p) for p in images]
+    photo_metas = [read_photo_metadata(p) for p in images]
+    POSITIONING_TYPE = "RTKBaseStation" if all(m["is_rtk_fix"] for m in photo_metas) else "GPS"
+    gps4=[(m["lat"], m["lon"], m["alt"]) for m in photo_metas]
     tf=FacadeTransformer(gps4)
     validate_facade_corner_geometry(tf)
 
@@ -845,11 +948,11 @@ def build_waylines_wpml(tf: FacadeTransformer, wps: List[Tuple[float,float,float
     # Mission Config
     mcfg = SubElement(doc, "wpml:missionConfig")
     SubElement(mcfg, "wpml:flyToWaylineMode").text = "safely"
-    SubElement(mcfg, "wpml:finishAction").text = "goHome"
-    SubElement(mcfg, "wpml:exitOnRCLost").text = "goContinue"
-    SubElement(mcfg, "wpml:executeRCLostAction").text = "goBack"
-    SubElement(mcfg, "wpml:takeOffSecurityHeight").text = "100"
-    SubElement(mcfg, "wpml:globalTransitionalSpeed").text = "15"
+    SubElement(mcfg, "wpml:finishAction").text = MISSION_FINISH_ACTION
+    SubElement(mcfg, "wpml:exitOnRCLost").text = MISSION_EXIT_ON_RC_LOST
+    SubElement(mcfg, "wpml:executeRCLostAction").text = MISSION_EXECUTE_RC_LOST_ACTION
+    SubElement(mcfg, "wpml:takeOffSecurityHeight").text = _wpml_number(TAKE_OFF_SECURITY_HEIGHT)
+    SubElement(mcfg, "wpml:globalTransitionalSpeed").text = _wpml_number(GLOBAL_TRANSITIONAL_SPEED)
     SubElement(mcfg, "wpml:globalRTHHeight").text = "100"
     
     # Drone Info (use enum values)
@@ -928,7 +1031,12 @@ def build_waylines_wpml(tf: FacadeTransformer, wps: List[Tuple[float,float,float
         
         SubElement(pm, "wpml:useStraightLine").text = "1"
 
-        if ENABLE_PHOTO_CAPTURE and CAPTURE_MODE == "waypoint":
+        if ENABLE_PHOTO_CAPTURE and CAPTURE_MODE == "video":
+            if i == 0:
+                _add_video_record_group(pm, 0, i, "startRecord")
+            if i == len(wps) - 1:
+                _add_video_record_group(pm, len(wps), i, "stopRecord")
+        elif ENABLE_PHOTO_CAPTURE and CAPTURE_MODE == "waypoint":
             # Action group
             agroup = SubElement(pm, "wpml:actionGroup")
             SubElement(agroup, "wpml:actionGroupId").text = str(i)
@@ -995,17 +1103,17 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
     # Mission Config
     mcfg = SubElement(doc, "wpml:missionConfig")
     SubElement(mcfg, "wpml:flyToWaylineMode").text = "safely"
-    SubElement(mcfg, "wpml:finishAction").text = "goHome"
-    SubElement(mcfg, "wpml:exitOnRCLost").text = "goContinue"
-    SubElement(mcfg, "wpml:executeRCLostAction").text = "goBack"
-    SubElement(mcfg, "wpml:takeOffSecurityHeight").text = "100"
+    SubElement(mcfg, "wpml:finishAction").text = MISSION_FINISH_ACTION
+    SubElement(mcfg, "wpml:exitOnRCLost").text = MISSION_EXIT_ON_RC_LOST
+    SubElement(mcfg, "wpml:executeRCLostAction").text = MISSION_EXECUTE_RC_LOST_ACTION
+    SubElement(mcfg, "wpml:takeOffSecurityHeight").text = _wpml_number(TAKE_OFF_SECURITY_HEIGHT)
     
     # Add takeOffRefPoint (first waypoint)
     lat0, lon0, alt0 = wps[0]
     SubElement(mcfg, "wpml:takeOffRefPoint").text = f"{lat0},{lon0},{alt0}"
     SubElement(mcfg, "wpml:takeOffRefPointAGLHeight").text = "5.0"
     
-    SubElement(mcfg, "wpml:globalTransitionalSpeed").text = "15"
+    SubElement(mcfg, "wpml:globalTransitionalSpeed").text = _wpml_number(GLOBAL_TRANSITIONAL_SPEED)
     SubElement(mcfg, "wpml:globalRTHHeight").text = "100"
     
     # Drone Info (use enum values)
@@ -1030,6 +1138,7 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
     coordsys = SubElement(folder, "wpml:waylineCoordinateSysParam")
     SubElement(coordsys, "wpml:coordinateMode").text = "WGS84"
     SubElement(coordsys, "wpml:heightMode").text = TEMPLATE_HEIGHT_MODE
+    SubElement(coordsys, "wpml:positioningType").text = POSITIONING_TYPE
     
     SubElement(folder, "wpml:autoFlightSpeed").text = str(AUTO_FLIGHT_SPEED)
     
@@ -1038,7 +1147,7 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
     SubElement(folder, "wpml:globalHeight").text = f"{avg_height:.9f}"
     
     SubElement(folder, "wpml:caliFlightEnable").text = "0"
-    gimbal_pitch_mode = "usePointSetting" if CAPTURE_MODE in {"distance", "time"} else "manual"
+    gimbal_pitch_mode = "usePointSetting" if CAPTURE_MODE in {"time", "video"} else "manual"
     SubElement(folder, "wpml:gimbalPitchMode").text = gimbal_pitch_mode
 
     # Heading facing wall: Y' points toward facade, so drone faces in Y' direction
@@ -1108,13 +1217,18 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
         SubElement(pm, "wpml:useGlobalHeight").text = "0"  # ✓ 修复：使用各自高度
         SubElement(pm, "wpml:useGlobalSpeed").text = "1"
         SubElement(pm, "wpml:useGlobalHeadingParam").text = "1"
-        SubElement(pm, "wpml:useGlobalTurnParam").text = "0" if CAPTURE_MODE in {"distance", "time"} else "1"
+        SubElement(pm, "wpml:useGlobalTurnParam").text = "1"
         SubElement(pm, "wpml:useStraightLine").text = "1"
 
-        if CAPTURE_MODE in {"distance", "time"}:
+        if CAPTURE_MODE in {"time", "video"}:
             SubElement(pm, "wpml:gimbalPitchAngle").text = f"{GIMBAL_PITCH_DEG:.0f}"
 
-        if ENABLE_PHOTO_CAPTURE and CAPTURE_MODE == "waypoint":
+        if ENABLE_PHOTO_CAPTURE and CAPTURE_MODE == "video":
+            if i == 0:
+                _add_video_record_group(pm, 0, i, "startRecord")
+            if i == len(wps) - 1:
+                _add_video_record_group(pm, len(wps), i, "stopRecord")
+        elif ENABLE_PHOTO_CAPTURE and CAPTURE_MODE == "waypoint":
             # Action group
             agroup = SubElement(pm, "wpml:actionGroup")
             SubElement(agroup, "wpml:actionGroupId").text = str(i)
@@ -1159,12 +1273,11 @@ def build_template_kml(tf: FacadeTransformer, wps: List[Tuple[float,float,float]
     # Payload param at folder level
     pparam = SubElement(folder, "wpml:payloadParam")
     SubElement(pparam, "wpml:payloadPositionIndex").text = "0"
-    SubElement(pparam, "wpml:imageFormat").text = "wide"
+    SubElement(pparam, "wpml:imageFormat").text = IMAGE_FORMAT
 
     return root
 
 # ====================== KMZ Packaging ==========================
-import re
 
 def sanitize_name(name: str) -> str:
     # allow letters, numbers, spaces, and hyphens only
@@ -1200,7 +1313,7 @@ def write_kmz(template_xml: Element, waylines_xml: Element, kmz_path: str):
 # ============================ Main =============================
 
 def main(argv: List[str]):
-    logger.info("Starting Mavic 3T Facade Mission Planner")
+    logger.info("Starting AeroFacade Studio")
     if len(argv) >= 5:
         images = argv[1:]
         logger.debug(f"Using {len(images)} images from command line arguments")

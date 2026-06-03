@@ -1,6 +1,6 @@
 # GUI 设计说明
 
-本文档用通俗语言说明当前 `gui.py` 中桌面界面的设计。这个界面是一个面向 DJI Mavic 3T / M3E 的立面航线规划工具，帮助用户从 4 张带 GPS 信息的立面角点照片生成 DJI 可用的 KMZ 航线文件，以及用于预览的 KML 文件。
+本文档用通俗语言说明当前 `gui.py` 中桌面界面的设计。AeroFacade Studio 是一个面向 DJI Mavic 3T / M3E 的立面航线规划工具，帮助用户从 4 张带 GPS 信息的立面角点照片生成 DJI 可用的 KMZ 航线文件，以及用于预览的 KML 文件。
 
 ## 整体设计目的
 
@@ -15,7 +15,7 @@
 5. 航线生成
 6. 输出
 
-主窗口使用可滚动布局，适合在较小屏幕上显示较多参数。窗口标题为 `Mavic 3T Facade Mission Planner`。
+主窗口使用可滚动布局，适合在较小屏幕上显示较多参数。窗口标题为 `AeroFacade Studio`。
 
 ## 1. Input Settings：输入设置
 

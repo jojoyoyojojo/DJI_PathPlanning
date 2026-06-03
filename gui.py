@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PySide6 GUI for Mavic 3T Facade Mission Planner
+PySide6 GUI for AeroFacade Studio
 
 Provides a desktop interface for the drone mission planning tool with:
 - Drag & drop image/folder input
@@ -14,7 +14,7 @@ import sys
 import os
 import struct
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -368,12 +368,14 @@ class FacadeGridDropZone(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Mavic 3T Facade Mission Planner")
+        self.setWindowTitle("AeroFacade Studio")
         self.setMinimumSize(600, 800)
 
         # State
         self.image_paths: List[str] = []
         self.gps_data: List[Optional[Tuple[float, float, float]]] = []
+        self.photo_metadata: List[Optional[Dict[str, Any]]] = []
+        self.all_photos_rtk_fix: bool = False
         self.generated_waypoints: List[Tuple[float, float, float]] = []
         self.transformer: Optional[core.FacadeTransformer] = None
         self.flight_direction: str = ""
@@ -539,12 +541,13 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Capture Mode:"), 1, 0)
         self.combo_capture_mode = QComboBox()
-        self.combo_capture_mode.addItem("Stop at each waypoint", "waypoint")
-        self.combo_capture_mode.addItem("Continuous by distance", "distance")
-        self.combo_capture_mode.addItem("Continuous by time", "time")
-        self.combo_capture_mode.addItem("No photo capture", "none")
+        self.combo_capture_mode.addItem("By time", "time")
+        self.combo_capture_mode.addItem("Fixed-point photos", "waypoint")
+        self.combo_capture_mode.addItem("Video", "video")
+        self.combo_capture_mode.addItem("No capture", "none")
         self.combo_capture_mode.setToolTip(
-            "Waypoint mode pauses at each point. Continuous modes shoot while passing waypoints."
+            "Time mode takes photos by interval; waypoint mode stops for photos; "
+            "video mode records from first waypoint to last."
         )
         self.combo_capture_mode.currentIndexChanged.connect(self._on_capture_mode_changed)
         layout.addWidget(self.combo_capture_mode, 1, 1, 1, 3)
@@ -567,6 +570,69 @@ class MainWindow(QMainWindow):
         self.lbl_capture_hint.setStyleSheet("color: #666; font-size: 11px;")
         layout.addWidget(self.lbl_capture_hint, 3, 0, 1, 4)
 
+        self.lbl_time_speed_warning = QLabel("")
+        self.lbl_time_speed_warning.setWordWrap(True)
+        self.lbl_time_speed_warning.setStyleSheet("color: #f57c00; font-size: 12px; font-weight: bold;")
+        self.lbl_time_speed_warning.setVisible(False)
+        layout.addWidget(self.lbl_time_speed_warning, 4, 0, 1, 4)
+
+        layout.addWidget(QLabel("Image Format:"), 5, 0)
+        self.combo_image_format = QComboBox()
+        self.combo_image_format.currentIndexChanged.connect(self._on_param_changed)
+        layout.addWidget(self.combo_image_format, 5, 1, 1, 3)
+
+        advanced = QGroupBox("Advanced Safety Settings")
+        adv = QGridLayout(advanced)
+
+        adv.addWidget(QLabel("Finish Action:"), 0, 0)
+        self.combo_finish_action = QComboBox()
+        self.combo_finish_action.addItem("No action", "noAction")
+        self.combo_finish_action.addItem("Return to home", "goHome")
+        self.combo_finish_action.addItem("Auto land", "autoLand")
+        self.combo_finish_action.addItem("Go to first waypoint", "gotoFirstWaypoint")
+        self.combo_finish_action.currentIndexChanged.connect(self._on_param_changed)
+        adv.addWidget(self.combo_finish_action, 0, 1)
+
+        adv.addWidget(QLabel("RC Lost:"), 0, 2)
+        self.combo_exit_on_rc_lost = QComboBox()
+        self.combo_exit_on_rc_lost.addItem("Execute lost action", "executeLostAction")
+        self.combo_exit_on_rc_lost.addItem("Continue route", "goContinue")
+        self.combo_exit_on_rc_lost.currentIndexChanged.connect(self._on_param_changed)
+        adv.addWidget(self.combo_exit_on_rc_lost, 0, 3)
+
+        adv.addWidget(QLabel("Lost Action:"), 1, 0)
+        self.combo_execute_rc_lost = QComboBox()
+        self.combo_execute_rc_lost.addItem("Hover", "hover")
+        self.combo_execute_rc_lost.addItem("Go back", "goBack")
+        self.combo_execute_rc_lost.addItem("Land", "landing")
+        self.combo_execute_rc_lost.currentIndexChanged.connect(self._on_param_changed)
+        adv.addWidget(self.combo_execute_rc_lost, 1, 1)
+
+        adv.addWidget(QLabel("Takeoff Sec. Height (m):"), 1, 2)
+        self.spin_takeoff_security_height = QDoubleSpinBox()
+        self.spin_takeoff_security_height.setRange(1.2, 1500.0)
+        self.spin_takeoff_security_height.setValue(core.TAKE_OFF_SECURITY_HEIGHT)
+        self.spin_takeoff_security_height.setDecimals(1)
+        self.spin_takeoff_security_height.valueChanged.connect(self._on_param_changed)
+        adv.addWidget(self.spin_takeoff_security_height, 1, 3)
+
+        adv.addWidget(QLabel("Transition Speed (m/s):"), 2, 0)
+        self.spin_global_transition_speed = QDoubleSpinBox()
+        self.spin_global_transition_speed.setRange(1.0, 15.0)
+        self.spin_global_transition_speed.setValue(core.GLOBAL_TRANSITIONAL_SPEED)
+        self.spin_global_transition_speed.setDecimals(1)
+        self.spin_global_transition_speed.valueChanged.connect(self._on_param_changed)
+        adv.addWidget(self.spin_global_transition_speed, 2, 1)
+
+        self.lbl_rc_lost_hint = QLabel(
+            "If RC Lost is 'Continue route', DJI may continue the mission instead of using the lost action."
+        )
+        self.lbl_rc_lost_hint.setWordWrap(True)
+        self.lbl_rc_lost_hint.setStyleSheet("color: #666; font-size: 11px;")
+        adv.addWidget(self.lbl_rc_lost_hint, 2, 2, 1, 2)
+
+        layout.addWidget(advanced, 6, 0, 1, 4)
+
         return group
 
     # -------------------------------------------------------------------------
@@ -583,6 +649,11 @@ class MainWindow(QMainWindow):
             "Drop 4 corner photos (BL → TL → TR → BR, facing the wall) to display GPS…"
         )
         layout.addWidget(self.txt_info)
+
+        self.lbl_rtk_warning = QLabel("")
+        self.lbl_rtk_warning.setWordWrap(True)
+        self.lbl_rtk_warning.setVisible(False)
+        layout.addWidget(self.lbl_rtk_warning)
 
         return group
 
@@ -601,7 +672,7 @@ class MainWindow(QMainWindow):
 
         self.lbl_raw_order_warning = QLabel("")
         self.lbl_raw_order_warning.setWordWrap(True)
-        self.lbl_raw_order_warning.setStyleSheet("color: #f44336; font-weight: bold;")
+        self.lbl_raw_order_warning.setStyleSheet("color: #f57c00; font-weight: bold;")
         self.lbl_raw_order_warning.setVisible(False)
         layout.addWidget(self.lbl_raw_order_warning)
 
@@ -718,11 +789,16 @@ class MainWindow(QMainWindow):
         logger.info("Clearing all loaded images")
         self.image_paths = []
         self.gps_data = []
+        self.photo_metadata = []
+        self.all_photos_rtk_fix = False
         self.corner_geometry_ok = False
         self.facade_width = None
         self.facade_height = None
         self.drop_zone.clear()
         self.txt_info.clear()
+        if hasattr(self, "lbl_rtk_warning"):
+            self.lbl_rtk_warning.clear()
+            self.lbl_rtk_warning.setVisible(False)
         if hasattr(self, "lbl_raw_order_warning"):
             self.lbl_raw_order_warning.clear()
             self.lbl_raw_order_warning.setVisible(False)
@@ -766,6 +842,25 @@ class MainWindow(QMainWindow):
         actual_overlap = max(0.0, min(1.0, 1.0 - actual_spacing / coverage))
         return direction, target_spacing, recommended_speed, actual_overlap
 
+    def _time_speed_warning_text(self) -> Optional[str]:
+        if self.combo_capture_mode.currentData() != "time":
+            return None
+        _, _, recommended_speed, actual_overlap = self._capture_hint_values()
+        target_speed = max(
+            core.AUTO_FLIGHT_SPEED_MIN,
+            min(core.AUTO_FLIGHT_SPEED_MAX, recommended_speed),
+        )
+        target_speed = round(target_speed, self.spin_speed.decimals())
+        current_speed = self.spin_speed.value()
+        if abs(current_speed - target_speed) <= 0.05:
+            return None
+        return (
+            "Warning: By time mode needs the recommended speed to maintain the target overlap. "
+            f"Recommended {target_speed:.1f} m/s, current {current_speed:.1f} m/s "
+            f"(estimated overlap {actual_overlap * 100:.0f}%). Click 'Use Recommended Speed' "
+            "or manually match the speed before generating."
+        )
+
     def _update_capture_controls(self):
         """Refresh controls and estimate text for continuous capture."""
         mode = self.combo_capture_mode.currentData()
@@ -776,11 +871,6 @@ class MainWindow(QMainWindow):
         direction, target_spacing, recommended_speed, actual_overlap = self._capture_hint_values()
         if mode == "waypoint":
             text = "Current mode: drone stops at each waypoint, then shoots. Highest positional accuracy."
-        elif mode == "distance":
-            text = (
-                f"Continuous distance mode: trigger every {target_spacing:.2f} m "
-                f"for {self.spin_overlap.value()}% target overlap ({direction} route)."
-            )
         elif mode == "time":
             interval = self.spin_capture_interval.value()
             actual_spacing = self.spin_speed.value() * interval
@@ -788,11 +878,21 @@ class MainWindow(QMainWindow):
                 f"Continuous time mode: {interval:.1f}s interval. Recommended speed "
                 f"{recommended_speed:.2f} m/s for {self.spin_overlap.value()}% overlap; "
                 f"current speed gives {actual_spacing:.2f} m/photo and about "
-                f"{actual_overlap * 100:.0f}% overlap ({direction} route)."
+                f"{actual_overlap * 100:.0f}% overlap ({direction} route). "
+                "Route corners still stop to preserve facade coverage."
+            )
+        elif mode == "video":
+            text = (
+                "Video mode: recording starts at the first waypoint and stops at the last waypoint. "
+                "The route uses continuous turns for smoother constant-speed footage."
             )
         else:
-            text = "Current mode: no photo actions will be written to the KMZ."
+            text = "Current mode: no photo or video actions will be written to the KMZ."
         self.lbl_capture_hint.setText(text)
+        if hasattr(self, "lbl_time_speed_warning"):
+            warning = self._time_speed_warning_text()
+            self.lbl_time_speed_warning.setText(warning or "")
+            self.lbl_time_speed_warning.setVisible(bool(warning))
 
     def _apply_recommended_speed(self):
         """Set speed from the current time interval and target overlap."""
@@ -817,11 +917,34 @@ class MainWindow(QMainWindow):
         self.spin_vfov.blockSignals(False)
         self.spin_hfov.setEnabled(False)
         self.spin_vfov.setEnabled(False)
+        self._refresh_image_format_options()
+
+    def _refresh_image_format_options(self):
+        if not hasattr(self, "combo_image_format"):
+            return
+        current = self.combo_image_format.currentData() or core.IMAGE_FORMAT
+        self.combo_image_format.blockSignals(True)
+        self.combo_image_format.clear()
+        if self.combo_drone.currentText() == "M3T":
+            options = [
+                ("Visible only (wide)", "wide"),
+                ("Infrared only", "ir"),
+                ("Visible + infrared", "wide,ir"),
+            ]
+        else:
+            options = [("Visible only (wide)", "wide")]
+        for label, value in options:
+            self.combo_image_format.addItem(label, value)
+        idx = self.combo_image_format.findData(current)
+        self.combo_image_format.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo_image_format.blockSignals(False)
 
     def _extract_gps(self):
         """Extract GPS per facade corner slot (BL, TL, TR, BR — facing wall)."""
         logger.debug("Extracting GPS data from images")
         self.gps_data = []
+        self.photo_metadata = []
+        self.all_photos_rtk_fix = False
         self.corner_geometry_ok = False
         self.facade_width = None
         self.facade_height = None
@@ -840,19 +963,50 @@ class MainWindow(QMainWindow):
             if not path:
                 info_lines.append(f"{label}: (no photo assigned)")
                 self.gps_data.append(None)
+                self.photo_metadata.append(None)
                 continue
             try:
-                lat, lon, alt = core.read_gps(path)
+                meta = core.read_photo_metadata(path)
+                lat, lon, alt = meta["lat"], meta["lon"], meta["alt"]
                 self.gps_data.append((lat, lon, alt))
+                self.photo_metadata.append(meta)
                 lat_dir = "N" if lat >= 0 else "S"
                 lon_dir = "E" if lon >= 0 else "W"
+                rtk_text = (
+                    "RTK FIX"
+                    if meta["is_rtk_fix"]
+                    else f"RTK not confirmed (GPSStatus={meta['gps_status'] or 'unknown'}, "
+                         f"RtkFlag={meta['rtk_flag'] or 'unknown'})"
+                )
                 info_lines.append(
-                    f"{label}: {abs(lat):.6f}°{lat_dir}, {abs(lon):.6f}°{lon_dir}, {alt:.1f}m (WGS84)"
+                    f"{label}: {abs(lat):.6f}°{lat_dir}, {abs(lon):.6f}°{lon_dir}, "
+                    f"{alt:.1f}m (WGS84), {rtk_text}"
                 )
             except Exception as e:
                 logger.error(f"Failed to extract GPS for {label}: {e}")
                 info_lines.append(f"{label}: ERROR — {e}")
                 self.gps_data.append(None)
+                self.photo_metadata.append(None)
+
+        all_slots_have_meta = len(self.photo_metadata) == 4 and all(m is not None for m in self.photo_metadata)
+        self.all_photos_rtk_fix = (
+            all_slots_have_meta and all(bool(m["is_rtk_fix"]) for m in self.photo_metadata if m)
+        )
+        if hasattr(self, "lbl_rtk_warning"):
+            if all_slots_have_meta and self.all_photos_rtk_fix:
+                self.lbl_rtk_warning.setText("RTK status: all 4 photos are confirmed RTK FIX.")
+                self.lbl_rtk_warning.setStyleSheet("color: #2e7d32; font-size: 11px;")
+                self.lbl_rtk_warning.setVisible(True)
+            elif all_slots_have_meta:
+                self.lbl_rtk_warning.setText(
+                    "Warning: Not all photos are confirmed RTK FIX. Facade geometry may be inaccurate; "
+                    "close facade flight is not recommended."
+                )
+                self.lbl_rtk_warning.setStyleSheet("color: #f57c00; font-size: 11px; font-weight: bold;")
+                self.lbl_rtk_warning.setVisible(True)
+            else:
+                self.lbl_rtk_warning.clear()
+                self.lbl_rtk_warning.setVisible(False)
 
         # Facade geometry + near-rectangle corners (blocks Generate if invalid)
         if len(self.gps_data) == 4 and all(g is not None for g in self.gps_data):
@@ -905,6 +1059,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Some images have invalid GPS data.")
             return
 
+        time_speed_warning = self._time_speed_warning_text()
+        if time_speed_warning:
+            reply = QMessageBox.warning(
+                self,
+                "By Time Speed Warning",
+                time_speed_warning + "\n\nGenerate anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
         try:
             # Update core module parameters
             logger.debug(f"Parameters: distance={self.spin_photo_dist.value()}")
@@ -923,9 +1089,16 @@ class MainWindow(QMainWindow):
             core.FORCE_VERTICAL_PLANE = self.chk_force_vertical.isChecked()
             core.AUTO_FLIGHT_SPEED = self.spin_speed.value()
             core.GIMBAL_PITCH_DEG = self.spin_gimbal.value()
+            core.MISSION_FINISH_ACTION = self.combo_finish_action.currentData()
+            core.MISSION_EXIT_ON_RC_LOST = self.combo_exit_on_rc_lost.currentData()
+            core.MISSION_EXECUTE_RC_LOST_ACTION = self.combo_execute_rc_lost.currentData()
+            core.TAKE_OFF_SECURITY_HEIGHT = self.spin_takeoff_security_height.value()
+            core.GLOBAL_TRANSITIONAL_SPEED = self.spin_global_transition_speed.value()
+            core.IMAGE_FORMAT = self.combo_image_format.currentData()
+            core.POSITIONING_TYPE = "RTKBaseStation" if self.all_photos_rtk_fix else "GPS"
             capture_mode = self.combo_capture_mode.currentData()
             core.ENABLE_PHOTO_CAPTURE = capture_mode != "none"
-            core.CAPTURE_MODE = "waypoint" if capture_mode == "none" else capture_mode
+            core.CAPTURE_MODE = capture_mode
             core.CAPTURE_TIME_INTERVAL = self.spin_capture_interval.value()
 
             # Generate
@@ -936,8 +1109,10 @@ class MainWindow(QMainWindow):
             status = (
                 f"Status: {len(self.generated_waypoints)} waypoints generated\n"
                 f"Drone: {drone_type}\n"
+                f"Positioning: {core.POSITIONING_TYPE}\n"
                 f"Direction: {self.flight_direction} snake pattern\n"
-                f"Capture: {self.combo_capture_mode.currentText()}"
+                f"Capture: {self.combo_capture_mode.currentText()}\n"
+                f"Image format: {core.IMAGE_FORMAT}"
             )
             self.lbl_gen_status.setText(status)
             self.lbl_gen_status.setStyleSheet("color: #4caf50;")
@@ -1037,7 +1212,7 @@ class MainWindow(QMainWindow):
 # =============================================================================
 
 def main():
-    logger.info("Starting Mavic 3T Facade Mission Planner GUI")
+    logger.info("Starting AeroFacade Studio GUI")
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
