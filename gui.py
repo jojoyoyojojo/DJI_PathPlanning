@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QFrame, QSizePolicy, QScrollArea
 )
 from PySide6.QtCore import Qt, Signal, QMimeData
-from PySide6.QtGui import QPixmap, QDragEnterEvent, QDropEvent, QImage
+from PySide6.QtGui import QPixmap, QDragEnterEvent, QDragMoveEvent, QDropEvent, QImage
 from loguru import logger
 
 # Import core algorithm functions
@@ -183,11 +183,34 @@ def _load_image_pixmap(path: str) -> QPixmap:
 
 # Slot indices match mavic3T_pp_kmz.FacadeTransformer: 0=BL, 1=TL, 2=TR, 3=BR
 
+TIME_CAPTURE_SPEED_WARNING_MPS = 3.0
+
+
+def _is_supported_image_path(path: str) -> bool:
+    return os.path.isfile(path) and path.lower().endswith((".jpg", ".jpeg", ".dng"))
+
+
+def _image_paths_from_mime(mime: QMimeData, include_folder_images: bool = False) -> List[str]:
+    if not mime.hasUrls():
+        return []
+
+    paths: List[str] = []
+    for url in mime.urls():
+        path = url.toLocalFile()
+        if not path:
+            continue
+        if _is_supported_image_path(path):
+            paths.append(path)
+        elif include_folder_images and os.path.isdir(path):
+            paths.extend(FacadeGridDropZone.scan_folder_images(path))
+    return paths
+
 
 class FacadeCornerSlot(QFrame):
     """Single corner cell: drop one JPG/JPEG here."""
 
     image_dropped = Signal(int, str)  # slot_index, path
+    clear_requested = Signal(int)  # slot_index
 
     def __init__(self, slot_index: int, title: str, parent=None):
         super().__init__(parent)
@@ -209,12 +232,44 @@ class FacadeCornerSlot(QFrame):
 
         lay = QVBoxLayout(self)
         lay.setSpacing(4)
+
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
         self._title = QLabel(title)
+        self._title.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._title.setAlignment(Qt.AlignCenter)
         self._title.setStyleSheet("font-size: 11px; font-weight: bold; color: #333;")
-        lay.addWidget(self._title)
+        title_row.addWidget(self._title, stretch=1)
+
+        self.btn_clear = QPushButton("X")
+        self.btn_clear.setFixedSize(20, 20)
+        self.btn_clear.setToolTip("Clear this corner")
+        self.btn_clear.setEnabled(False)
+        self.btn_clear.setStyleSheet("""
+            QPushButton {
+                color: #666;
+                background-color: #f5f5f5;
+                border: 1px solid #ccc;
+                border-radius: 10px;
+                font-size: 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover:enabled {
+                color: white;
+                background-color: #d32f2f;
+                border-color: #d32f2f;
+            }
+            QPushButton:disabled {
+                color: #bbb;
+                background-color: #eee;
+            }
+        """)
+        self.btn_clear.clicked.connect(lambda: self.clear_requested.emit(self.slot_index))
+        title_row.addWidget(self.btn_clear)
+        lay.addLayout(title_row)
 
         self.thumb = QLabel()
+        self.thumb.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.thumb.setFixedSize(72, 72)
         self.thumb.setFrameStyle(QFrame.Box | QFrame.Plain)
         self.thumb.setAlignment(Qt.AlignCenter)
@@ -223,6 +278,7 @@ class FacadeCornerSlot(QFrame):
         lay.addWidget(self.thumb, alignment=Qt.AlignCenter)
 
         self.name_lbl = QLabel("Empty")
+        self.name_lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.name_lbl.setAlignment(Qt.AlignCenter)
         self.name_lbl.setWordWrap(True)
         self.name_lbl.setStyleSheet("font-size: 9px; color: #666; max-width: 96px;")
@@ -247,26 +303,41 @@ class FacadeCornerSlot(QFrame):
                 self.thumb.clear()
                 self.thumb.setText("DNG" if path.lower().endswith(".dng") else "ERR")
             self.name_lbl.setText(Path(path).name[:16])
+            self.btn_clear.setEnabled(True)
         else:
             self.thumb.clear()
             self.thumb.setText("—")
             self.name_lbl.setText("Empty")
+            self.btn_clear.setEnabled(False)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
+        if _image_paths_from_mime(event.mimeData(), include_folder_images=True):
             event.acceptProposedAction()
             self._set_drag_over(True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent):
+        if _image_paths_from_mime(event.mimeData(), include_folder_images=True):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def dragLeaveEvent(self, event):
         self._set_drag_over(False)
 
     def dropEvent(self, event: QDropEvent):
         self._set_drag_over(False)
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if path.lower().endswith((".jpg", ".jpeg", ".dng")) and os.path.isfile(path):
-                self.image_dropped.emit(self.slot_index, path)
-                break
+        paths = _image_paths_from_mime(event.mimeData(), include_folder_images=True)
+        if paths:
+            parent = self.parent()
+            if len(paths) >= 4 and hasattr(parent, "apply_sequential_paths"):
+                parent.apply_sequential_paths(paths[:4])
+            else:
+                self.image_dropped.emit(self.slot_index, paths[0])
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
 
 class FacadeGridDropZone(QFrame):
@@ -279,13 +350,26 @@ class FacadeGridDropZone(QFrame):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAcceptDrops(True)
         self.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
         self.slot_paths: List[Optional[str]] = [None, None, None, None]
+        self._drag_over = False
+        self.setStyleSheet("""
+            FacadeGridDropZone {
+                background-color: #ffffff;
+                border: 1px solid #ddd;
+            }
+            FacadeGridDropZone[drag_over="true"] {
+                background-color: #f1f8ff;
+                border: 2px dashed #2196f3;
+            }
+        """)
 
         outer = QVBoxLayout(self)
         outer.setSpacing(8)
 
         hint = QLabel("Facing the wall — top row is upper on the facade ↑")
+        hint.setAttribute(Qt.WA_TransparentForMouseEvents)
         hint.setAlignment(Qt.AlignCenter)
         hint.setStyleSheet("color: #555; font-size: 11px;")
         outer.addWidget(hint)
@@ -303,6 +387,7 @@ class FacadeGridDropZone(QFrame):
         for slot_idx, row, col, title in layout_spec:
             cell = FacadeCornerSlot(slot_idx, title, self)
             cell.image_dropped.connect(self._on_slot_image)
+            cell.clear_requested.connect(self._on_slot_clear)
             by_slot[slot_idx] = cell
             grid.addWidget(cell, row, col)
         self._cells = [by_slot[i] for i in range(4)]
@@ -312,6 +397,7 @@ class FacadeGridDropZone(QFrame):
         self.instruction = QLabel(
             "Drop on each cell, or use Select / Folder (fills BL→TL→TR→BR in order)."
         )
+        self.instruction.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.instruction.setAlignment(Qt.AlignCenter)
         self.instruction.setWordWrap(True)
         self.instruction.setStyleSheet("color: #888; font-size: 11px;")
@@ -322,6 +408,43 @@ class FacadeGridDropZone(QFrame):
         self._cells[slot].set_path(path)
         self._update_instruction()
         self.grid_changed.emit()
+
+    def _on_slot_clear(self, slot: int) -> None:
+        self.slot_paths[slot] = None
+        self._cells[slot].set_path(None)
+        self._update_instruction()
+        self.grid_changed.emit()
+
+    def _set_drag_over(self, on: bool) -> None:
+        self._drag_over = on
+        self.setProperty("drag_over", on)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if _image_paths_from_mime(event.mimeData(), include_folder_images=True):
+            event.acceptProposedAction()
+            self._set_drag_over(True)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent):
+        if _image_paths_from_mime(event.mimeData(), include_folder_images=True):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._set_drag_over(False)
+
+    def dropEvent(self, event: QDropEvent):
+        self._set_drag_over(False)
+        paths = _image_paths_from_mime(event.mimeData(), include_folder_images=True)
+        if not paths:
+            event.ignore()
+            return
+        self.apply_sequential_paths(paths[:4])
+        event.acceptProposedAction()
 
     def _update_instruction(self) -> None:
         n = sum(1 for p in self.slot_paths if p)
@@ -541,13 +664,12 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Capture Mode:"), 1, 0)
         self.combo_capture_mode = QComboBox()
-        self.combo_capture_mode.addItem("By time", "time")
-        self.combo_capture_mode.addItem("Fixed-point photos", "waypoint")
+        self.combo_capture_mode.addItem("Timed Photos", "time")
+        self.combo_capture_mode.addItem("Stable Photos", "waypoint")
         self.combo_capture_mode.addItem("Video", "video")
-        self.combo_capture_mode.addItem("No capture", "none")
+        self.combo_capture_mode.addItem("Flight Only", "none")
         self.combo_capture_mode.setToolTip(
-            "Time mode takes photos by interval; waypoint mode stops for photos; "
-            "video mode records from first waypoint to last."
+            "Timed photos capture by interval; stable photos pause at each waypoint."
         )
         self.combo_capture_mode.currentIndexChanged.connect(self._on_capture_mode_changed)
         layout.addWidget(self.combo_capture_mode, 1, 1, 1, 3)
@@ -561,10 +683,6 @@ class MainWindow(QMainWindow):
         self.spin_capture_interval.valueChanged.connect(self._on_param_changed)
         layout.addWidget(self.spin_capture_interval, 2, 1)
 
-        self.btn_use_recommended_speed = QPushButton("Use Recommended Speed")
-        self.btn_use_recommended_speed.clicked.connect(self._apply_recommended_speed)
-        layout.addWidget(self.btn_use_recommended_speed, 2, 2, 1, 2)
-
         self.lbl_capture_hint = QLabel("")
         self.lbl_capture_hint.setWordWrap(True)
         self.lbl_capture_hint.setStyleSheet("color: #666; font-size: 11px;")
@@ -576,10 +694,24 @@ class MainWindow(QMainWindow):
         self.lbl_time_speed_warning.setVisible(False)
         layout.addWidget(self.lbl_time_speed_warning, 4, 0, 1, 4)
 
-        layout.addWidget(QLabel("Image Format:"), 5, 0)
-        self.combo_image_format = QComboBox()
-        self.combo_image_format.currentIndexChanged.connect(self._on_param_changed)
-        layout.addWidget(self.combo_image_format, 5, 1, 1, 3)
+        self.lbl_camera_output = QLabel("Output:")
+        layout.addWidget(self.lbl_camera_output, 5, 0)
+        channel_layout = QHBoxLayout()
+        self.chk_visible_channel = QCheckBox("Visible")
+        self.chk_visible_channel.setChecked(True)
+        self.chk_visible_channel.stateChanged.connect(self._on_image_channel_changed)
+        channel_layout.addWidget(self.chk_visible_channel)
+
+        self.chk_thermal_channel = QCheckBox("Thermal")
+        self.chk_thermal_channel.stateChanged.connect(self._on_image_channel_changed)
+        channel_layout.addWidget(self.chk_thermal_channel)
+
+        self.lbl_capture_output_value = QLabel("")
+        self.lbl_capture_output_value.setStyleSheet("color: #444;")
+        self.lbl_capture_output_value.setVisible(False)
+        channel_layout.addWidget(self.lbl_capture_output_value)
+        channel_layout.addStretch()
+        layout.addLayout(channel_layout, 5, 1, 1, 3)
 
         advanced = QGroupBox("Advanced Safety Settings")
         adv = QGridLayout(advanced)
@@ -625,7 +757,7 @@ class MainWindow(QMainWindow):
         adv.addWidget(self.spin_global_transition_speed, 2, 1)
 
         self.lbl_rc_lost_hint = QLabel(
-            "If RC Lost is 'Continue route', DJI may continue the mission instead of using the lost action."
+            "Continue route ignores Lost Action."
         )
         self.lbl_rc_lost_hint.setWordWrap(True)
         self.lbl_rc_lost_hint.setStyleSheet("color: #666; font-size: 11px;")
@@ -759,13 +891,10 @@ class MainWindow(QMainWindow):
         """Open folder dialog to select image folder."""
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder:
-            images = []
-            for f in sorted(os.listdir(folder)):
-                if f.lower().endswith(('.jpg', '.jpeg')):
-                    images.append(os.path.join(folder, f))
+            images = FacadeGridDropZone.scan_folder_images(folder)
 
             if not images:
-                QMessageBox.warning(self, "No Images", "No JPG/JPEG images found in folder.")
+                QMessageBox.warning(self, "No Images", "No JPG/JPEG/DNG images found in folder.")
                 return
 
             if len(images) < 4:
@@ -845,63 +974,76 @@ class MainWindow(QMainWindow):
     def _time_speed_warning_text(self) -> Optional[str]:
         if self.combo_capture_mode.currentData() != "time":
             return None
-        _, _, recommended_speed, actual_overlap = self._capture_hint_values()
-        target_speed = max(
-            core.AUTO_FLIGHT_SPEED_MIN,
-            min(core.AUTO_FLIGHT_SPEED_MAX, recommended_speed),
-        )
-        target_speed = round(target_speed, self.spin_speed.decimals())
+        self._apply_time_capture_speed()
         current_speed = self.spin_speed.value()
-        if abs(current_speed - target_speed) <= 0.05:
+        if current_speed <= TIME_CAPTURE_SPEED_WARNING_MPS:
             return None
         return (
-            "Warning: By time mode needs the recommended speed to maintain the target overlap. "
-            f"Recommended {target_speed:.1f} m/s, current {current_speed:.1f} m/s "
-            f"(estimated overlap {actual_overlap * 100:.0f}%). Click 'Use Recommended Speed' "
-            "or manually match the speed before generating."
+            f"High speed: {current_speed:.1f} m/s > {TIME_CAPTURE_SPEED_WARNING_MPS:.1f} m/s. "
+            "Increase interval/overlap, or use Stable Photos."
         )
 
     def _update_capture_controls(self):
         """Refresh controls and estimate text for continuous capture."""
         mode = self.combo_capture_mode.currentData()
         is_time = mode == "time"
+        is_photo_mode = mode in {"time", "waypoint"}
+        is_m3t = self.combo_drone.currentText() == "M3T"
         self.spin_capture_interval.setEnabled(is_time)
-        self.btn_use_recommended_speed.setEnabled(is_time)
+        self.spin_speed.setEnabled(not is_time)
+        if hasattr(self, "chk_visible_channel"):
+            self.lbl_camera_output.setEnabled(True)
+            self.chk_visible_channel.setVisible(is_photo_mode)
+            self.chk_thermal_channel.setVisible(is_photo_mode)
+            self.chk_visible_channel.setEnabled(is_photo_mode)
+            self.chk_thermal_channel.setEnabled(is_photo_mode and is_m3t)
+            self.lbl_capture_output_value.setVisible(not is_photo_mode)
+            self.lbl_capture_output_value.setEnabled(True)
+            if mode == "video":
+                self.lbl_capture_output_value.setText("Video")
+            elif mode == "none":
+                self.lbl_capture_output_value.setText("None")
+        self.spin_speed.setToolTip(
+            "Automatically set from interval and overlap in Timed Photos."
+            if is_time
+            else f"{core.AUTO_FLIGHT_SPEED_MIN}–{core.AUTO_FLIGHT_SPEED_MAX} m/s"
+        )
 
-        direction, target_spacing, recommended_speed, actual_overlap = self._capture_hint_values()
+        if is_time:
+            self._apply_time_capture_speed()
+
+        direction, _, _, actual_overlap = self._capture_hint_values()
         if mode == "waypoint":
-            text = "Current mode: drone stops at each waypoint, then shoots. Highest positional accuracy."
+            text = "Stable: pause at each waypoint."
         elif mode == "time":
             interval = self.spin_capture_interval.value()
-            actual_spacing = self.spin_speed.value() * interval
             text = (
-                f"Continuous time mode: {interval:.1f}s interval. Recommended speed "
-                f"{recommended_speed:.2f} m/s for {self.spin_overlap.value()}% overlap; "
-                f"current speed gives {actual_spacing:.2f} m/photo and about "
-                f"{actual_overlap * 100:.0f}% overlap ({direction} route). "
-                "Route corners still stop to preserve facade coverage."
+                f"Timed: {interval:.1f}s, {self.spin_speed.value():.2f} m/s, "
+                f"{actual_overlap * 100:.0f}% overlap ({direction})."
             )
         elif mode == "video":
-            text = (
-                "Video mode: recording starts at the first waypoint and stops at the last waypoint. "
-                "The route uses continuous turns for smoother constant-speed footage."
-            )
+            text = "Video: record from first to last waypoint."
         else:
-            text = "Current mode: no photo or video actions will be written to the KMZ."
+            text = "Flight only: no capture."
         self.lbl_capture_hint.setText(text)
         if hasattr(self, "lbl_time_speed_warning"):
             warning = self._time_speed_warning_text()
             self.lbl_time_speed_warning.setText(warning or "")
             self.lbl_time_speed_warning.setVisible(bool(warning))
 
-    def _apply_recommended_speed(self):
-        """Set speed from the current time interval and target overlap."""
+    def _apply_time_capture_speed(self):
+        """Set cruise speed from the current time interval and target overlap."""
         _, _, recommended_speed, _ = self._capture_hint_values()
         recommended_speed = max(
             core.AUTO_FLIGHT_SPEED_MIN,
             min(core.AUTO_FLIGHT_SPEED_MAX, recommended_speed),
         )
+        recommended_speed = round(recommended_speed, self.spin_speed.decimals())
+        if abs(self.spin_speed.value() - recommended_speed) <= 0.05:
+            return
+        was_blocked = self.spin_speed.blockSignals(True)
         self.spin_speed.setValue(recommended_speed)
+        self.spin_speed.blockSignals(was_blocked)
 
     def _on_drone_type_changed(self, _text: Optional[str] = None):
         """Apply selected aircraft/payload profile and lock FOV to the preset."""
@@ -920,24 +1062,56 @@ class MainWindow(QMainWindow):
         self._refresh_image_format_options()
 
     def _refresh_image_format_options(self):
-        if not hasattr(self, "combo_image_format"):
+        if not hasattr(self, "chk_visible_channel"):
             return
-        current = self.combo_image_format.currentData() or core.IMAGE_FORMAT
-        self.combo_image_format.blockSignals(True)
-        self.combo_image_format.clear()
-        if self.combo_drone.currentText() == "M3T":
-            options = [
-                ("Visible only (wide)", "wide"),
-                ("Infrared only", "ir"),
-                ("Visible + infrared", "wide,ir"),
-            ]
+        current = self._current_image_format() if hasattr(self, "chk_thermal_channel") else core.IMAGE_FORMAT
+        selected = {part.strip() for part in current.split(",") if part.strip()}
+        is_m3t = self.combo_drone.currentText() == "M3T"
+
+        self.chk_visible_channel.blockSignals(True)
+        self.chk_thermal_channel.blockSignals(True)
+        self.chk_visible_channel.setEnabled(True)
+        self.chk_thermal_channel.setEnabled(is_m3t)
+        if is_m3t:
+            visible = "wide" in selected
+            thermal = "ir" in selected
+            if not visible and not thermal:
+                visible = True
         else:
-            options = [("Visible only (wide)", "wide")]
-        for label, value in options:
-            self.combo_image_format.addItem(label, value)
-        idx = self.combo_image_format.findData(current)
-        self.combo_image_format.setCurrentIndex(idx if idx >= 0 else 0)
-        self.combo_image_format.blockSignals(False)
+            visible = True
+            thermal = False
+        self.chk_visible_channel.setChecked(visible)
+        self.chk_thermal_channel.setChecked(thermal)
+        self.chk_visible_channel.blockSignals(False)
+        self.chk_thermal_channel.blockSignals(False)
+
+    def _current_image_format(self) -> str:
+        channels = []
+        if self.chk_visible_channel.isChecked():
+            channels.append("wide")
+        if self.chk_thermal_channel.isChecked() and self.chk_thermal_channel.isEnabled():
+            channels.append("ir")
+        return ",".join(channels) or "wide"
+
+    @staticmethod
+    def _image_format_label(value: str) -> str:
+        parts = {part.strip() for part in value.split(",") if part.strip()}
+        if parts == {"wide", "ir"}:
+            return "Visible + Thermal"
+        if parts == {"ir"}:
+            return "Thermal"
+        return "Visible"
+
+    def _on_image_channel_changed(self):
+        if not hasattr(self, "chk_visible_channel"):
+            return
+        if not self.chk_visible_channel.isChecked() and not self.chk_thermal_channel.isChecked():
+            sender = self.sender()
+            target = self.chk_thermal_channel if sender is self.chk_thermal_channel else self.chk_visible_channel
+            target.blockSignals(True)
+            target.setChecked(True)
+            target.blockSignals(False)
+        self._on_param_changed()
 
     def _extract_gps(self):
         """Extract GPS per facade corner slot (BL, TL, TR, BR — facing wall)."""
@@ -1063,7 +1237,7 @@ class MainWindow(QMainWindow):
         if time_speed_warning:
             reply = QMessageBox.warning(
                 self,
-                "By Time Speed Warning",
+                "High Speed Warning",
                 time_speed_warning + "\n\nGenerate anyway?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
@@ -1094,9 +1268,13 @@ class MainWindow(QMainWindow):
             core.MISSION_EXECUTE_RC_LOST_ACTION = self.combo_execute_rc_lost.currentData()
             core.TAKE_OFF_SECURITY_HEIGHT = self.spin_takeoff_security_height.value()
             core.GLOBAL_TRANSITIONAL_SPEED = self.spin_global_transition_speed.value()
-            core.IMAGE_FORMAT = self.combo_image_format.currentData()
-            core.POSITIONING_TYPE = "RTKBaseStation" if self.all_photos_rtk_fix else "GPS"
             capture_mode = self.combo_capture_mode.currentData()
+            core.IMAGE_FORMAT = (
+                self._current_image_format()
+                if capture_mode in {"time", "waypoint"}
+                else "wide"
+            )
+            core.POSITIONING_TYPE = "RTKBaseStation" if self.all_photos_rtk_fix else "GPS"
             core.ENABLE_PHOTO_CAPTURE = capture_mode != "none"
             core.CAPTURE_MODE = capture_mode
             core.CAPTURE_TIME_INTERVAL = self.spin_capture_interval.value()
@@ -1106,15 +1284,20 @@ class MainWindow(QMainWindow):
                 core.build_waypoints_from_images(self.image_paths)
 
             logger.success(f"Generated {len(self.generated_waypoints)} waypoints ({self.flight_direction} pattern)")
-            status = (
-                f"Status: {len(self.generated_waypoints)} waypoints generated\n"
-                f"Drone: {drone_type}\n"
-                f"Positioning: {core.POSITIONING_TYPE}\n"
-                f"Direction: {self.flight_direction} snake pattern\n"
-                f"Capture: {self.combo_capture_mode.currentText()}\n"
-                f"Image format: {core.IMAGE_FORMAT}"
-            )
-            self.lbl_gen_status.setText(status)
+            status_lines = [
+                f"Status: {len(self.generated_waypoints)} waypoints generated",
+                f"Drone: {drone_type}",
+                f"Positioning: {core.POSITIONING_TYPE}",
+                f"Direction: {self.flight_direction} snake pattern",
+                f"Capture: {self.combo_capture_mode.currentText()}",
+            ]
+            if capture_mode in {"time", "waypoint"}:
+                status_lines.append(f"Output: {self._image_format_label(core.IMAGE_FORMAT)}")
+            elif capture_mode == "video":
+                status_lines.append("Output: Video")
+            else:
+                status_lines.append("Output: None")
+            self.lbl_gen_status.setText("\n".join(status_lines))
             self.lbl_gen_status.setStyleSheet("color: #4caf50;")
             self._update_capture_controls()
 
